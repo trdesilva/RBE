@@ -18,6 +18,7 @@ def get_basic_tetrominoes():
     """
     :return: a list of arrays representing the tetrominoes shown in the assignment
     """
+    print("Encoding basic tetromino set...")
     return [np.atleast_2d(np.array([1, 1, 1, 1])).transpose(),
                np.array([[1, 0, 0],
                           [1, 1, 1]]).transpose(), # L (upside down per fig. 2)
@@ -30,6 +31,7 @@ def get_all_tetrominoes():
     """
     :return: a list of arrays representing all valid tetrominoes, including rotations and mirrors
     """
+    print("Enumerating all tetrominoes...")
     tetrominoes = []
     bar = np.atleast_2d(np.array([1, 1, 1, 1]))
     tetrominoes.append(bar)
@@ -75,15 +77,16 @@ def populate_cells(coverage: float, use_all_tets: bool = False):
     :param use_all_tets: if true, use all possible tetrominoes instead of just the ones on the assignment doc
     :return: None
     """
-    total = int(coverage*FIELD_HEIGHT*FIELD_WIDTH/4)
     tetrominoes = get_all_tetrominoes() if use_all_tets else get_basic_tetrominoes()
+    total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
+    print(f'Placing {total} tetrominoes...')
     tets_to_place = rng.integers(len(tetrominoes), size=total)
     for tet in tets_to_place:
         tet_cells = tetrominoes[tet]
         #print(tet_cells)
         tet_bounds = np.shape(tet_cells)
-        x = rng.integers(0, FIELD_WIDTH - tet_bounds[1])
-        y = rng.integers(0, FIELD_HEIGHT - tet_bounds[0])
+        x = rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
+        y = rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
         for i in np.ndindex(tet_bounds):
             cells[y + i[0], x + i[1]] = tet_cells[i] or cells[y + i[0], x + i[1]]
 
@@ -95,12 +98,22 @@ def get_cell_bounds(x, y):
                      [(x + 1)*cell_width + (x)*cell_border, (y + 1)*cell_height + (y)*cell_border]]) + 2*cell_border
 
 def get_gradient(v):
+    """
+    :param v: percentage of red-yellow-green gradient to interpolate to, on [0, 1]
+    :return: a string containing a hex representation of an RBG color
+    """
     return f'#{int(min(255, 512 * v)):02x}{int(min(255, 512 - 512 * v)):02x}00'
 
 def get_threshold(v, threshold):
+    """
+    :param v: any number
+    :param threshold: black/white transition point
+    :return: white (as hex RGB in string) if v > threshold, else black
+    """
     return "#000000" if v > threshold else "#ffffff"
 
 def draw_grid(canvas: tk.Canvas):
+    print(f'Drawing {FIELD_WIDTH} x {FIELD_HEIGHT} grid...')
     for y in range(FIELD_HEIGHT):
         for x in range(FIELD_WIDTH):
             cell_bounds = get_cell_bounds(x, y)
