@@ -56,8 +56,8 @@ def draw_victor_sierra_drift(radius, heading, drift_func, datum_tur, drift_tur):
 draw_victor_sierra(200, 0)
 
 # more interesting patterns
-#datum_tur = tur.Turtle()
-#drift_tur = tur.Turtle()
-#draw_victor_sierra_drift(200, 0, lambda t: (20, 40*np.cos(t*2*np.pi/9)), datum_tur, drift_tur)
-#draw_victor_sierra_drift(200, 0, lambda t: (t*t, 0), datum_tur, drift_tur)
+datum_tur = tur.Turtle()
+drift_tur = tur.Turtle()
+draw_victor_sierra_drift(200, 0, lambda t: (20, 40*np.cos(t*2*np.pi/9)), datum_tur, drift_tur)
+draw_victor_sierra_drift(200, 0, lambda t: (t*t, 0), datum_tur, drift_tur)
 input("Done")

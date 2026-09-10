@@ -127,7 +127,7 @@ if __name__ == "__main__":
     canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
     canvas = tk.Canvas(frame, width=canvas_size[0] + cell_border, height=canvas_size[1] + cell_border, bg="gray")
     canvas.grid()
-    populate_cells(1)
+    populate_cells(0.7, True)
     draw_grid(canvas)
     frame.pack()
     root_window.mainloop()
