@@ -5,7 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/turtles/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/turtles/.venv" />
     </content>
-    <orderEntry type="jdk" jdkName="~\src\RBE\RBE550\flatland\.venv" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="~\src\RBE\RBE550\turtles\.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

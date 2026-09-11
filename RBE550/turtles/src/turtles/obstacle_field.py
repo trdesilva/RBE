@@ -6,13 +6,15 @@ from tkinter import ttk
 FIELD_WIDTH = 128
 FIELD_HEIGHT = 128
 
-rng = np.random.default_rng()
-cells = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
-#print(cells)
+_rng = np.random.default_rng()
+_cells = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
+_rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
+_dirty_cells = list(np.ndenumerate(_cells))
+_fill_func = lambda value: get_threshold(value, 0.5)
 
-cell_width = 6
-cell_height = 6
-cell_border = 1
+_cell_width = 6
+_cell_height = 6
+_cell_border = 1
 
 def get_basic_tetrominoes():
     """
@@ -70,32 +72,41 @@ def get_all_tetrominoes():
                                  [1,1]]))
     return tetrominoes
 
-def populate_cells(coverage: float, use_all_tets: bool = False):
+def populate_cells(coverage: float, use_all_tets: bool = False, canvas = None):
     """
     :param coverage: approximate percentage of cells that should be occupied, on [0, 1]
     (tetrominoes may overlap so coverage is an upper bound)
     :param use_all_tets: if true, use all possible tetrominoes instead of just the ones on the assignment doc
+    :param canvas: the canvas to draw on
     :return: None
     """
+    global _cells, _dirty_cells, _rects
+    _cells = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
+    _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
+
     tetrominoes = get_all_tetrominoes() if use_all_tets else get_basic_tetrominoes()
     total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
     print(f'Placing {total} tetrominoes...')
-    tets_to_place = rng.integers(len(tetrominoes), size=total)
+    tets_to_place = _rng.integers(len(tetrominoes), size=total)
     for tet in tets_to_place:
         tet_cells = tetrominoes[tet]
         #print(tet_cells)
         tet_bounds = np.shape(tet_cells)
-        x = rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
-        y = rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
+        x = _rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
+        y = _rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
         for i in np.ndindex(tet_bounds):
-            cells[y + i[0], x + i[1]] = tet_cells[i] or cells[y + i[0], x + i[1]]
+            _cells[y + i[0], x + i[1]] = tet_cells[i] or _cells[y + i[0], x + i[1]]
+
+    _dirty_cells = list(np.ndenumerate(_cells))
+    if canvas is not None:
+        draw_grid(canvas)
 
 def get_cell_bounds(x, y):
     """
      returns cell bounds in pixels exclusive of borders
     """
-    return np.array([[x*cell_width + (x)*cell_border, y*cell_height + (y)*cell_border],
-                     [(x + 1)*cell_width + (x)*cell_border, (y + 1)*cell_height + (y)*cell_border]]) + 2*cell_border
+    return np.array([[x * _cell_width + (x) * _cell_border, y * _cell_height + (y) * _cell_border],
+                     [(x + 1) * _cell_width + (x) * _cell_border, (y + 1) * _cell_height + (y) * _cell_border]]) + 2*_cell_border
 
 def get_gradient(v):
     """
@@ -113,21 +124,34 @@ def get_threshold(v, threshold):
     return "#000000" if v > threshold else "#ffffff"
 
 def draw_grid(canvas: tk.Canvas):
-    print(f'Drawing {FIELD_WIDTH} x {FIELD_HEIGHT} grid...')
-    for y in range(FIELD_HEIGHT):
-        for x in range(FIELD_WIDTH):
-            cell_bounds = get_cell_bounds(x, y)
-            #print(f'({x},{y}) => {cell_bounds}')
-            canvas.create_rectangle(cell_bounds[0][0], cell_bounds[0][1], cell_bounds[1][0], cell_bounds[1][1], fill=get_threshold(cells[y][x], 0.5), outline="gray", width=cell_border)
+    global _dirty_cells, _rects
+    for (coords, value) in _dirty_cells:
+        x, y = coords
+        cell_bounds = get_cell_bounds(x, y)
+        #print(f'({x},{y}) => {cell_bounds}')
+        if _rects[y][x] == 0:
+            _rects[y][x] = canvas.create_rectangle(cell_bounds[0][0], cell_bounds[0][1], cell_bounds[1][0], cell_bounds[1][1], fill=_fill_func(value), outline="gray", width=_cell_border)
+        else:
+            canvas.itemconfigure(_rects[y][x], fill=_fill_func(value))
+    _dirty_cells = []
 
-if __name__ == "__main__":
+def update_cell(x, y, value):
+    global _cells, _dirty_cells
+    _cells[y][x] = value
+    _dirty_cells.append(((x, y), value))
+
+def create_window():
     root_window = tk.Tk()
     frame = ttk.Frame(root_window, padding=10)
     frame.grid()
     canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
-    canvas = tk.Canvas(frame, width=canvas_size[0] + cell_border, height=canvas_size[1] + cell_border, bg="gray")
+    canvas = tk.Canvas(frame, width=canvas_size[0] + _cell_border, height=canvas_size[1] + _cell_border, bg="gray")
     canvas.grid()
-    populate_cells(0.7, True)
-    draw_grid(canvas)
-    frame.pack()
-    root_window.mainloop()
+    return root_window, frame, canvas
+
+if __name__ == "__main__":
+    _root_window, _frame, _canvas = create_window()
+    draw_grid(_canvas)
+    populate_cells(0.7, True, _canvas)
+    _frame.pack()
+    _root_window.mainloop()

@@ -7,11 +7,15 @@ name = "flatland"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "turtles" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "turtles", editable = "../turtles" }]
+requires-dist = [
+    { name = "numpy", specifier = ">=2.5.3" },
+    { name = "turtles", editable = "../turtles" },
+]
 
 [[package]]
 name = "numpy"
