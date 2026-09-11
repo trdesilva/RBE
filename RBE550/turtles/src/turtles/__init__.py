@@ -1,4 +1,3 @@
 __all__ = ["obstacle_field"]
 
-def main() -> None:
-    print("Hello from turtles!")
+from obstacle_field import *
