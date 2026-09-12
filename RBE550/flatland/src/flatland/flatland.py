@@ -181,6 +181,7 @@ if __name__ == "__main__":
     obs._cell_width = 10
     obs._fill_func = get_fill_color
     root_window, frame, canvas = obs.create_window()
+    root_window.title("Flatland")
     obs.draw_grid(canvas)
     obs.populate_cells(0.05, True, canvas)
 
@@ -200,7 +201,7 @@ if __name__ == "__main__":
     start_button = ttk.Button(frame, text='Start', command=start_time)
     start_button.grid(row=1, column=0)
     stop_button = ttk.Button(frame, text='Stop', command=stop_time)
-    stop_button.grid(row=1, column=1)
+    stop_button.grid(row=2, column=0)
 
     frame.pack()
     root_window.mainloop()
