@@ -2,6 +2,7 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk
 import copy
+import time
 
 # occupancy grid dimensions
 FIELD_WIDTH = 128
@@ -106,12 +107,16 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas = None):
     if canvas is not None:
         draw_grid(canvas)
 
+__bounds_cache = {}
 def get_cell_bounds(x, y):
     """
      returns cell bounds in pixels exclusive of borders
     """
-    return np.array([[x * _cell_width + (x) * _cell_border, y * _cell_height + (y) * _cell_border],
-                     [(x + 1) * _cell_width + (x) * _cell_border, (y + 1) * _cell_height + (y) * _cell_border]]) + 2*_cell_border
+    global __bounds_cache
+    if __bounds_cache.get((x, y), None) is None:
+        __bounds_cache[(x, y)] = np.array([[x * _cell_width + (x) * _cell_border, y * _cell_height + (y) * _cell_border],
+                                           [(x + 1) * _cell_width + (x) * _cell_border, (y + 1) * _cell_height + (y) * _cell_border]]) + 2*_cell_border
+    return __bounds_cache[(x, y)]
 
 def get_gradient(v):
     """
@@ -131,14 +136,20 @@ def get_threshold(v, threshold):
 def draw_grid(canvas: tk.Canvas):
     global _dirty_cells, _rects
     for (coords, values) in _dirty_cells:
+        perf = time.perf_counter_ns()
         x, y = coords
         cell_bounds = get_cell_bounds(x, y)
+        perf2 = time.perf_counter_ns()
+        #print(f'bounds calc: {perf2 - perf}')
         #print(f'({x},{y}) => {cell_bounds}')
         if _rects[y][x] == 0:
             _rects[y][x] = canvas.create_rectangle(cell_bounds[0][0], cell_bounds[0][1], cell_bounds[1][0], cell_bounds[1][1], fill=_fill_func(values), outline="gray", width=_cell_border)
         else:
             canvas.itemconfigure(int(_rects[y][x]), fill=_fill_func(values))
-    _dirty_cells = []
+        perf3 = time.perf_counter_ns()
+        #print(f'rect drawing: {perf3 - perf2}')
+    _dirty_cells.clear()
+    #print(f'dirty cells clear: {time.perf_counter_ns() - perf3}')
 
 def add_to_cell(x, y, value):
     global _cells, _dirty_cells
