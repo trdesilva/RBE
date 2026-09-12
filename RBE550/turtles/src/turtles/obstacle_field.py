@@ -1,16 +1,17 @@
 import numpy as np
 import tkinter as tk
 from tkinter import ttk
+import copy
 
 # occupancy grid dimensions
 FIELD_WIDTH = 128
 FIELD_HEIGHT = 128
 
 _rng = np.random.default_rng()
-_cells = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
-_rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
-_dirty_cells = list(np.ndenumerate(_cells))
-_fill_func = lambda value: get_threshold(value, 0.5)
+_cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
+_rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
+_dirty_cells = [((i, j), []) for i in range(FIELD_WIDTH) for j in range(FIELD_HEIGHT)]
+_fill_func = lambda value: 'black' if value is not None and len(value) > 0 and value[0] > 0 else 'white'
 
 _cell_width = 6
 _cell_height = 6
@@ -81,7 +82,7 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas = None):
     :return: None
     """
     global _cells, _dirty_cells, _rects
-    _cells = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
+    _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
     _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH))
 
     tetrominoes = get_all_tetrominoes() if use_all_tets else get_basic_tetrominoes()
@@ -90,14 +91,18 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas = None):
     tets_to_place = _rng.integers(len(tetrominoes), size=total)
     for tet in tets_to_place:
         tet_cells = tetrominoes[tet]
-        #print(tet_cells)
         tet_bounds = np.shape(tet_cells)
         x = _rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
         y = _rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
         for i in np.ndindex(tet_bounds):
-            _cells[y + i[0], x + i[1]] = tet_cells[i] or _cells[y + i[0], x + i[1]]
+            cell = _cells[y + i[0]][x + i[1]]
+            if tet_cells[i] == 1:
+                if len(cell) > 0:
+                    _cells[y + i[0]][x + i[1]][0] = tet_cells[i]
+                else:
+                    _cells[y + i[0]][x + i[1]].append(tet_cells[i])
 
-    _dirty_cells = list(np.ndenumerate(_cells))
+    _dirty_cells = [((j, i), _cells[i][j]) for i in range(FIELD_WIDTH) for j in range(FIELD_HEIGHT)]
     if canvas is not None:
         draw_grid(canvas)
 
@@ -125,27 +130,35 @@ def get_threshold(v, threshold):
 
 def draw_grid(canvas: tk.Canvas):
     global _dirty_cells, _rects
-    for (coords, value) in _dirty_cells:
+    for (coords, values) in _dirty_cells:
         x, y = coords
         cell_bounds = get_cell_bounds(x, y)
         #print(f'({x},{y}) => {cell_bounds}')
         if _rects[y][x] == 0:
-            _rects[y][x] = canvas.create_rectangle(cell_bounds[0][0], cell_bounds[0][1], cell_bounds[1][0], cell_bounds[1][1], fill=_fill_func(value), outline="gray", width=_cell_border)
+            _rects[y][x] = canvas.create_rectangle(cell_bounds[0][0], cell_bounds[0][1], cell_bounds[1][0], cell_bounds[1][1], fill=_fill_func(values), outline="gray", width=_cell_border)
         else:
-            canvas.itemconfigure(_rects[y][x], fill=_fill_func(value))
+            canvas.itemconfigure(int(_rects[y][x]), fill=_fill_func(values))
     _dirty_cells = []
 
-def update_cell(x, y, value):
+def add_to_cell(x, y, value):
     global _cells, _dirty_cells
-    _cells[y][x] = value
-    _dirty_cells.append(((x, y), value))
+    _cells[y][x].append(value)
+    _dirty_cells.append(((x, y), list(_cells[y][x])))
+
+def remove_from_cell(x, y, value):
+    global _cells, _dirty_cells
+    _cells[y][x].remove(value)
+    _dirty_cells.append(((x, y), list(_cells[y][x])))
+
+def get_cells_copy():
+    return [[_cells[y][x].copy() for x in range(len(_cells[y]))] for y in range(len(_cells))]
 
 def create_window():
     root_window = tk.Tk()
     frame = ttk.Frame(root_window, padding=10)
     frame.grid()
     canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
-    canvas = tk.Canvas(frame, width=canvas_size[0] + _cell_border, height=canvas_size[1] + _cell_border, bg="gray")
+    canvas = tk.Canvas(frame, width=canvas_size[0], height=canvas_size[1], bg="gray")
     canvas.grid()
     return root_window, frame, canvas
 
