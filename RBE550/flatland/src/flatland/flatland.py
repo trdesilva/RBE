@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk as ttk
 import functools
 import time
+from astar import AStar
 
 ENEMY_COUNT = 10
 GOAL_COUNT = 1
@@ -19,8 +20,9 @@ ENEMY = 5
 # game results
 GAME_OVER = -1
 
-movers = []
-hero = None
+_movers = []
+_hero = None
+_goals = []
 
 time_rate = 1
 
@@ -33,18 +35,20 @@ class Mover:
         self.cell_type = cell_type
         self.next_move = (0, 0)
 
-    def move(self):
+    def move(self, strict = True):
         (dx, dy) = self.next_move
-        if (abs(dx) == 1 and abs(dy) == 0) or (abs(dx) == 0 and abs(dy) == 1):
+        if (abs(dx) == 1 and abs(dy) == 0) or (abs(dx) == 0 and abs(dy) == 1) or not strict:
             self.x += dx
             self.y += dy
+            return True
         else:
             print(f'Illegal move by type {self.cell_type} at ({self.x}, {self.y}): ({dx}, {dy})')
+            return False
 
     def collide(self, with_list):
         return # no-op for base class
 
-    def update_plan(self, cells = None, hero = None, movers = None):
+    def update_plan(self, cells = None, hero = None, movers = None, goals = None):
         return # no-op for base class
 
     def __str__(self):
@@ -57,7 +61,7 @@ class Enemy(Mover):
     def __init__(self, x, y):
         super().__init__(x, y, ENEMY)
 
-    def move(self):
+    def move(self, strict = True):
         if self.next_move == (0, 0):
             return
         super().move()
@@ -76,7 +80,7 @@ class Enemy(Mover):
                     self.cell_type = JUNK
         return None
 
-    def update_plan(self, cells = None, hero = None, movers = None):
+    def update_plan(self, cells = None, hero = None, movers = None, goals = None):
         if self.cell_type == ENEMY:
             dx = hero.x - self.x
             dy = hero.y - self.y
@@ -87,24 +91,21 @@ class Enemy(Mover):
         else:
             self.next_move = (0, 0)
 
-class Hero(Mover):
+class Hero(Mover, AStar):
     def __init__(self, x, y):
-        super().__init__(x, y, HERO)
+        Mover.__init__(self, x, y, HERO)
+        AStar.__init__(self)
         self.teleports = 5
+        self.teleporting = False
+        self.cells = []
+        self.goal = (x, y)
 
-    def move(self):
+    def move(self, strict = True):
         if self.next_move == (0, 0):
             return
-        if abs(self.next_move[0]) <= 1 and abs(self.next_move[1]) <= 1:
-            super().move()
-            return
-        if self.teleports > 0:
+        super().move(strict = not self.teleporting)
+        if self.teleporting:
             self.teleports -= 1
-            self.x += self.next_move[0]
-            self.y += self.next_move[1]
-            print(f'Hero teleported to ({self.x}, {self.y}), {self.teleports} remaining')
-        else:
-            self.next_move = (0,0)
 
     def collide(self, with_list):
         for other in with_list:
@@ -124,13 +125,69 @@ class Hero(Mover):
                 return GAME_OVER
         return None
 
-    def update_plan(self, cells = None, hero = None, movers = None):
+    def update_plan(self, cells = None, hero = None, movers = None, goals = None):
         self.next_move = (0, 0)
+        self.teleporting = False
+        if cells is not None:
+            self.cells = cells
         for mover in movers:
             if mover == self:
                 continue
-            if abs(mover.x - self.x) <= 1 and abs(mover.y - self.y) <= 1:
-                self.next_move = (_rng.integers(-self.x,  -self.x + obs.FIELD_WIDTH), _rng.integers(-self.y, -self.y + obs.FIELD_HEIGHT))
+            if abs(mover.x - self.x) <= 1 and abs(mover.y - self.y) <= 1 and self.teleports > 0:
+                self.next_move = (_rng.integers(-self.x,  -self.x + obs.FIELD_WIDTH, dtype=int), _rng.integers(-self.y, -self.y + obs.FIELD_HEIGHT, dtype=int))
+                self.teleporting = True
+                print(f'Hero (threatened) teleporting to ({self.x + self.next_move[0]}, {self.y + self.next_move[1]}), {self.teleports - 1} remaining')
+                return
+        if goals is not None and len(goals) > 0:
+            self.goal = goals[0]
+            path = self.astar((self.x, self.y), self.goal)
+            if path:
+                path = list(path)
+                #print(f'Hero path: {path}')
+                path_next = list(path)[1] # the first item in path is always the current position
+                self.next_move = (path_next[0] - self.x, path_next[1] - self.y)
+            else:
+                print(f'Hero at ({self.x, self.y}) has no path to goal at ({goals[0][0], goals[0][1]})')
+                if self.teleports > 0:
+                    self.next_move = (_rng.integers(-self.x, -self.x + obs.FIELD_WIDTH, dtype=int),
+                                      _rng.integers(-self.y, -self.y + obs.FIELD_HEIGHT, dtype=int))
+                    self.teleporting = True
+                    print(f'Hero (stuck) teleporting to ({self.x + self.next_move[0]}, {self.y + self.next_move[1]}), {self.teleports - 1} remaining')
+    #
+    # AStar impl
+    #
+    def neighbors(self, node):
+        x, y = node
+        if 0 <= y < len(self.cells) and 0 <= x < len(self.cells[y]):
+            return [(x + i[0], y + i[1])
+                    for i in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                    if 0 <= y + i[1] < len(self.cells) and 0 <= x + i[0] < len(self.cells[y])
+                    and is_cell_empty(self.cells[y + i[1]][x + i[0]]) or (x + i[0] == self.x and y + i[1] == self.y)
+                    or (x + i[0] == self.goal[0] and y + i[1] == self.goal[1])]
+        return []
+
+    def heuristic_cost_estimate(self, current, goal) -> float:
+        cx, cy = current
+        gx, gy = goal
+        if 0 <= cy < len(self.cells) and 0 <= cx < len(self.cells[cy]):
+            if not is_cell_empty(self.cells[cy][cx]) and (cx != self.x and cy != self.y) and (cx != gx and cy != gy):
+                return float('inf')
+            return np.sqrt(np.power(gx - cx, 2) + np.power(gy - cy, 2))
+        return float('inf')
+
+    def distance_between(self, n1, n2) -> float:
+        return abs(n2[0] - n1[0]) + abs(n2[1] - n1[1])
+
+    def is_goal_reached(self, current, goal) -> bool:
+        return current[0] == goal[0] and current[1] == goal[1]
+
+def is_cell_empty(value):
+    if value is None or len(value) == 0:
+        return True
+    for v in value:
+        if v != EMPTY:
+            return False
+    return True
 
 def get_fill_color(value):
     if value is None or len(value) == 0:
@@ -160,16 +217,15 @@ def start_time():
     step_time()
 
 def step_time():
-    global movers, hero, time_rate
+    global _movers, _hero, time_rate
     loop_start = time.perf_counter_ns()
     perf1 = loop_start
     if time_rate > 0:
         # all movers move simultaneously, so plan -> move -> collide
-        # can't commit to main grid until everything is done
         #next_cells = obs.get_cells_copy()
         changes = []
-        for mover in movers:
-            mover.update_plan(cells=obs._cells, hero=hero, movers=movers)
+        for mover in _movers:
+            mover.update_plan(cells=obs._cells, hero=_hero, movers=_movers, goals=_goals)
             #next_cells[mover.y][mover.x].remove(mover)
             changes.append(functools.partial(lambda x, y, m: obs.remove_from_cell(x, y, m), x = mover.x, y = mover.y, m = mover))
         if __debug__:
@@ -178,12 +234,12 @@ def step_time():
             perf1 = perf2
 
         next_movers = []
-        for mover in movers:
+        for mover in _movers:
             mover.move()
             #next_cells[mover.y][mover.x].append(mover)
             changes.append(functools.partial(lambda x, y, m: obs.add_to_cell(x, y, m), x = mover.x, y = mover.y, m = mover))
             next_movers.append(mover)
-        movers = next_movers
+        _movers = next_movers
 
         if __debug__:
             perf2 = time.perf_counter_ns()
@@ -193,7 +249,7 @@ def step_time():
         for change in changes:
             change()
 
-        for mover in movers:
+        for mover in _movers:
             if mover.next_move != (0, 0):
                 result = mover.collide(obs._cells[mover.y][mover.x])
                 if result == GAME_OVER:
@@ -219,22 +275,23 @@ def stop_time():
     time_rate = 0
 
 def spawn_units():
-    global hero, movers
+    global _hero, _movers, _goals
     open_spaces = [(x, y) for y in range(len(obs._cells)) for x in range(len(obs._cells[y])) if len(obs._cells[y][x]) == 0 or obs._cells[y][x][0] == EMPTY]
     for i in range(ENEMY_COUNT):
         x, y = open_spaces.pop(_rng.integers(0, len(open_spaces), dtype=int))
-        movers.append(Enemy(x, y))
-        obs.add_to_cell(x, y, movers[i])
+        _movers.append(Enemy(x, y))
+        obs.add_to_cell(x, y, _movers[i])
         print(f'Placed enemy at ({x, y})')
     for i in range(GOAL_COUNT):
         x, y = open_spaces.pop(_rng.integers(0, len(open_spaces), dtype=int))
+        _goals.append((x, y))
         obs.add_to_cell(x, y, GOAL)
         print(f'Placed goal at ({x, y})')
 
     x, y = open_spaces.pop(_rng.integers(0, len(open_spaces), dtype=int))
-    hero = Hero(x, y)
-    movers.append(hero)
-    obs.add_to_cell(x, y, hero)
+    _hero = Hero(x, y)
+    _movers.append(_hero)
+    obs.add_to_cell(x, y, _hero)
     print(f'Placed hero at ({x, y})')
 
 if __name__ == "__main__":
@@ -247,7 +304,7 @@ if __name__ == "__main__":
     root_window, frame, canvas = obs.create_window()
     root_window.title("Flatland")
     obs.draw_grid(canvas)
-    obs.populate_cells(0.0, True, canvas)
+    obs.populate_cells(0.2, True, canvas)
 
     # create units
     spawn_units()
