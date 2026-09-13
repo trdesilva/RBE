@@ -12,11 +12,27 @@ wheels = [
 ]
 
 [[package]]
+name = "fastquadtree"
+version = "2.4.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/fc/64bfc68c0b2bcdb4cbd1cfd4a33379855dd8a1d8713cd9d5a7ad3f06aaf9/fastquadtree-2.4.2.tar.gz", hash = "sha256:d8eff682571e54179ed2b389bfed58e529611bf914945f7fe798e66edeee318e", size = 949898, upload-time = "2026-06-22T03:29:39.837Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/b3/bb699392d7de853b432e08e6625d29acc92eab9200386f609ebc65b2beb9/fastquadtree-2.4.2-cp39-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:3ff3b013a06e2308a5d97dd5f19d88b7bbe174eefad63204888fa5f2004b7b50", size = 817075, upload-time = "2026-06-22T03:29:31.015Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/31/65138e6497e2e078c1162a03d10e5f452ab717604080e0535aa2b8c4f841/fastquadtree-2.4.2-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:cb0b6e1a096a710aaa7d73e052f035e62c0ae22fbcb0be07bf7ad90ff1674403", size = 456172, upload-time = "2026-06-22T03:29:32.403Z" },
+    { url = "https://files.pythonhosted.org/packages/84/a8/c88b9a0df493ac4c4aa1e08355e248eba8860c5fd051109f873843a806cf/fastquadtree-2.4.2-cp39-abi3-manylinux_2_28_armv7l.whl", hash = "sha256:6f4411ed464694e292f984996f75b00440f573dd1bd57debd3da63487a09c9bd", size = 505217, upload-time = "2026-06-22T03:29:33.673Z" },
+    { url = "https://files.pythonhosted.org/packages/13/da/65db13bf90e4ecd1dd05a91af4ff199c0024de387c1ad0b9d364304c041c/fastquadtree-2.4.2-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b226e3eddd0aee6413275848fa543205ec8adf1c23b05a269e44dd12b9035171", size = 471595, upload-time = "2026-06-22T03:29:34.981Z" },
+    { url = "https://files.pythonhosted.org/packages/65/c7/95f0b0a37c473b1e40976508bf903c846ffe6261faad3601dd6a63eccf8d/fastquadtree-2.4.2-cp39-abi3-pyemscripten_2025_0_wasm32.whl", hash = "sha256:3ebc6508810c87ede4bafcb91d0d26ad4a198822851e9db2e18b728d9260b59e", size = 208610, upload-time = "2026-06-22T03:29:36.114Z" },
+    { url = "https://files.pythonhosted.org/packages/92/78/819cca848bdf5690c8acd19246b3455396b7cb00abe4ce0c59459c9b54c0/fastquadtree-2.4.2-cp39-abi3-pyemscripten_2026_0_wasm32.whl", hash = "sha256:af19ad98c5131cafb5f2838a3fdf3ec64250e9e775fce5931b71759c46502959", size = 208597, upload-time = "2026-06-22T03:29:37.093Z" },
+    { url = "https://files.pythonhosted.org/packages/07/95/d79860a954a3aef47bb8861d1091a36ea233344e60aa579d46884172e4ed/fastquadtree-2.4.2-cp39-abi3-win_amd64.whl", hash = "sha256:f45a72f868ac698ef668b7747e6f876e45347009fc1ae5ea2f09afd054fd4653", size = 318478, upload-time = "2026-06-22T03:29:38.408Z" },
+]
+
+[[package]]
 name = "flatland"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "astar" },
+    { name = "fastquadtree" },
     { name = "numpy" },
     { name = "turtles" },
 ]
@@ -24,6 +40,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "astar", specifier = ">=1.1" },
+    { name = "fastquadtree", specifier = ">=2.4.2" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "turtles", editable = "../turtles" },
 ]

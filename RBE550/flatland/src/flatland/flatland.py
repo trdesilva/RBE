@@ -5,6 +5,7 @@ from tkinter import ttk as ttk
 import functools
 import time
 from astar import AStar
+import fastquadtree
 
 ENEMY_COUNT = 10
 GOAL_COUNT = 1
@@ -20,7 +21,7 @@ ENEMY = 5
 # game results
 GAME_OVER = -1
 
-_movers = []
+_movers: fastquadtree.QuadTreeObjects = None
 _hero = None
 _goals = []
 
@@ -95,7 +96,7 @@ class Hero(Mover, AStar):
     def __init__(self, x, y):
         Mover.__init__(self, x, y, HERO)
         AStar.__init__(self)
-        self.teleports = 5
+        self.teleports = 0
         self.teleporting = False
         self.cells = []
         self.goal = (x, y)
@@ -130,7 +131,8 @@ class Hero(Mover, AStar):
         self.teleporting = False
         if cells is not None:
             self.cells = cells
-        for mover in movers:
+        for item in movers:
+            mover = item.obj
             if mover == self:
                 continue
             if abs(mover.x - self.x) <= 1 and abs(mover.y - self.y) <= 1 and self.teleports > 0:
@@ -172,14 +174,29 @@ class Hero(Mover, AStar):
         if 0 <= cy < len(self.cells) and 0 <= cx < len(self.cells[cy]):
             if not is_cell_empty(self.cells[cy][cx]) and (cx != self.x and cy != self.y) and (cx != gx and cy != gy):
                 return float('inf')
-            return np.sqrt(np.power(gx - cx, 2) + np.power(gy - cy, 2))
+            danger = self.calculate_danger(cx, cy)
+            return danger * np.sqrt(np.power(gx - cx, 2) + np.power(gy - cy, 2))
         return float('inf')
 
-    def distance_between(self, n1, n2) -> float:
-        return abs(n2[0] - n1[0]) + abs(n2[1] - n1[1])
+    def path_distance_between(self, n1, n2) -> float:
+        danger1 = self.calculate_danger(n1.data[0], n1.data[1])
+        danger2 = self.calculate_danger(n2.data[0], n2.data[1])
+        # moving to a less-dangerous space should be more appealing
+        return (danger2/danger1) * abs(n2.data[0] - n1.data[0]) + abs(n2.data[1] - n1.data[1])
 
     def is_goal_reached(self, current, goal) -> bool:
         return current[0] == goal[0] and current[1] == goal[1]
+
+    def calculate_danger(self, x, y):
+        danger = 1  # multiplier to cost based on enemy distance
+        nearest = _movers.nearest_neighbors((x, y), 2) # take 2 nearest because hero will be nearest for the most relevant spaces
+        if nearest is not None:
+            for n in nearest:
+                if n.obj.cell_type == ENEMY:
+                    # the base of the exponential represents how many cells away danger applies, while the exponent
+                    # represents the strength (3^4 seems to invoke a healthy level of fear in our hero)
+                    danger *= max(1, np.power(3, 4) / np.power(abs(n.x - x) + abs(n.y - y),4))
+        return danger
 
 def is_cell_empty(value):
     if value is None or len(value) == 0:
@@ -224,7 +241,8 @@ def step_time():
         # all movers move simultaneously, so plan -> move -> collide
         #next_cells = obs.get_cells_copy()
         changes = []
-        for mover in _movers:
+        for item in _movers:
+            mover = item.obj
             mover.update_plan(cells=obs._cells, hero=_hero, movers=_movers, goals=_goals)
             #next_cells[mover.y][mover.x].remove(mover)
             changes.append(functools.partial(lambda x, y, m: obs.remove_from_cell(x, y, m), x = mover.x, y = mover.y, m = mover))
@@ -233,13 +251,12 @@ def step_time():
             print(f'Planning: {perf2 - perf1}')
             perf1 = perf2
 
-        next_movers = []
-        for mover in _movers:
+        for item in _movers:
+            mover = item.obj
             mover.move()
             #next_cells[mover.y][mover.x].append(mover)
             changes.append(functools.partial(lambda x, y, m: obs.add_to_cell(x, y, m), x = mover.x, y = mover.y, m = mover))
-            next_movers.append(mover)
-        _movers = next_movers
+            _movers.update_by_object(mover, mover.x, mover.y)
 
         if __debug__:
             perf2 = time.perf_counter_ns()
@@ -249,7 +266,8 @@ def step_time():
         for change in changes:
             change()
 
-        for mover in _movers:
+        for item in _movers:
+            mover = item.obj
             if mover.next_move != (0, 0):
                 result = mover.collide(obs._cells[mover.y][mover.x])
                 if result == GAME_OVER:
@@ -276,11 +294,13 @@ def stop_time():
 
 def spawn_units():
     global _hero, _movers, _goals
+    _movers = fastquadtree.QuadTreeObjects((0, 0, obs.FIELD_WIDTH, obs.FIELD_HEIGHT), 4, dtype="i32")
     open_spaces = [(x, y) for y in range(len(obs._cells)) for x in range(len(obs._cells[y])) if len(obs._cells[y][x]) == 0 or obs._cells[y][x][0] == EMPTY]
     for i in range(ENEMY_COUNT):
         x, y = open_spaces.pop(_rng.integers(0, len(open_spaces), dtype=int))
-        _movers.append(Enemy(x, y))
-        obs.add_to_cell(x, y, _movers[i])
+        enemy = Enemy(x, y)
+        _movers.insert((x, y), obj=enemy)
+        obs.add_to_cell(x, y, enemy)
         print(f'Placed enemy at ({x, y})')
     for i in range(GOAL_COUNT):
         x, y = open_spaces.pop(_rng.integers(0, len(open_spaces), dtype=int))
@@ -290,7 +310,7 @@ def spawn_units():
 
     x, y = open_spaces.pop(_rng.integers(0, len(open_spaces), dtype=int))
     _hero = Hero(x, y)
-    _movers.append(_hero)
+    _movers.insert((x, y), obj=_hero)
     obs.add_to_cell(x, y, _hero)
     print(f'Placed hero at ({x, y})')
 
