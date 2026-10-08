@@ -92,7 +92,11 @@ class LabTfBroadcaster(Node):
         self.tf_broadcaster.sendTransform(self.frame_b)
 
         try:
-            self.get_logger().info(f'A to B transform: {self.tf_buffer.lookup_transform('frame_B', 'frame_A', Time(seconds = 0), Duration(seconds=0.1)).transform}')
+            self.get_logger().info(f'A to B transform: {self.tf_buffer.lookup_transform('frame_B', 'frame_A', Time(seconds = 0), Duration(seconds=0.1)).transform}\n'
+                                   f'A to world transform: {self.tf_buffer.lookup_transform('world', 'frame_A', Time(seconds = 0), Duration(seconds=0.1)).transform}\n'
+                                   f'A to base transform: {self.tf_buffer.lookup_transform('base', 'frame_A', Time(seconds = 0), Duration(seconds=0.1)).transform}\n'
+                                   f'B to world transform: {self.tf_buffer.lookup_transform('world', 'frame_B', Time(seconds = 0), Duration(seconds=0.1)).transform}\n'
+                                   f'B to base transform: {self.tf_buffer.lookup_transform('base', 'frame_B', Time(seconds = 0), Duration(seconds=0.1)).transform}\n')
         except TransformException as e:
             self.get_logger().warn('failed to get transform')
 
@@ -101,12 +105,14 @@ class LabTfBroadcaster(Node):
 def main():
     rclpy.init()
     node = LabTfBroadcaster()
-    node.get_logger().info('Starting up lab_tf_broadcaster')
+    node.get_logger().info('Starting up new lab_tf_broadcaster')
     node.static_tf_broadcaster.sendTransform(node.base)
-    node.tf_broadcaster.sendTransform(node.frame_a)
-    node.tf_broadcaster.sendTransform(node.frame_b)
+    # try to wake everything up before spinning
+    for i in range(10):
+        node.tf_broadcaster.sendTransform(node.frame_a)
+        node.tf_broadcaster.sendTransform(node.frame_b)
     try:
-        node.tf_buffer.lookup_transform('frame_B', 'frame_A', Time(seconds=0), Duration(seconds=5))
+        node.tf_buffer.lookup_transform('frame_B', 'frame_A', Time(seconds=0), Duration(seconds=2))
     except TransformException as e:
         node.get_logger().warn('tf_buffer warming timed out')
     try:
