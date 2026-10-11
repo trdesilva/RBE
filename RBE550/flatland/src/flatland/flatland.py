@@ -1,4 +1,4 @@
-from turtles import obstacle_field as obs
+from valet import obstacle_field as obs
 import numpy as np
 import tkinter as tk
 from tkinter import ttk as ttk
@@ -11,7 +11,7 @@ import fastquadtree
 GRID_SIZE = 64
 ENEMY_COUNT = 10
 GOAL_COUNT = 1 # TODO: having multiple goals isn't supported yet
-RUNNING_TIME_RATE = 1
+RUNNING_TIME_RATE = 10
 COVERAGE = 0.2
 
 # These constants affect how brave the hero is. Danger is a multiplier on cell cost of the form:

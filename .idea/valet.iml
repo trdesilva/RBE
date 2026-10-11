@@ -5,7 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/RBE550/valet/src" />
       <excludeFolder url="file://$MODULE_DIR$/RBE550/valet/.venv" />
     </content>
-    <orderEntry type="jdk" jdkName="G:\src\RBE\RBE550\.venv" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="G:\src\RBE\RBE550\valet\.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>
