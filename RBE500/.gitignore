@@ -2,3 +2,7 @@
 */log
 build
 log
+
+*_ws.zip
+*_pkg.zip
+**/*_pkg.zip
