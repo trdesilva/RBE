@@ -28,7 +28,6 @@ _rng = np.random.default_rng()
 _cells: list[list[list[Any]]] = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
 _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
 _bg_rects: list[Any] = []
-_dirty_cells: list[tuple[tuple[int, int], list[Any]]] = []
 _fill_func = lambda value: 'black' if value is not None and len(value) > 0 and value[0] > 0 else 'white'
 
 _cell_width = 6
@@ -811,10 +810,9 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
     :param canvas: the canvas/widget to draw on
     :return: None
     """
-    global _cells, _dirty_cells, _rects, _grid_colors
+    global _cells, _rects, _grid_colors
     _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
     _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
-    _dirty_cells.clear()
 
     empty_rgb = convert_text_to_rgb(_fill_func([]))
     _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), empty_rgb, dtype=np.uint8)
@@ -843,7 +841,7 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
     _grid_colors[occupied] = wall_rgb
 
     if canvas is not None:
-        draw_grid(canvas)
+        draw_grid()
 
 
 __bounds_cache: dict[tuple[int, int, int, int, int], np.ndarray] = {}
@@ -975,13 +973,13 @@ def _apply_vectorized_background(base_colors: np.ndarray, background: AdaptiveGr
     return base_colors
 
 
-def draw_grid(canvas=None, background: AdaptiveGradientBackground | None = None):
+def draw_grid(background: AdaptiveGradientBackground | None = None):
     """
     Renders the occupancy grid onto the OpenGL widget (or legacy Tkinter Canvas).
     Completely eliminates Python for-loops by relying on O(1) cell updates and NumPy vectorization.
     """
-    global _dirty_cells, _rects, _bg_rects, _grid_colors, _active_widget
-    target = canvas if canvas is not None else _active_widget
+    global _rects, _bg_rects, _grid_colors, _active_widget
+    target = _active_widget
 
     # Ensure color array matches field dimensions
     if _grid_colors is None or _grid_colors.shape[0] != FIELD_HEIGHT or _grid_colors.shape[1] != FIELD_WIDTH:
@@ -992,35 +990,14 @@ def draw_grid(canvas=None, background: AdaptiveGradientBackground | None = None)
     if background is not None:
         display_colors = _apply_vectorized_background(display_colors, background)
 
-    # GPU-accelerated rendering path via ObstacleFieldWidget
-    if isinstance(target, ObstacleFieldWidget):
-        canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
-        target.set_grid_data(
-            display_colors,
-            (FIELD_WIDTH, FIELD_HEIGHT),
-            (float(_cell_width), float(_cell_height)),
-            float(_cell_border),
-            (float(canvas_size[0]), float(canvas_size[1])),
-        )
-        return
-
-    # Fallback path for legacy Tkinter Canvas
-    if isinstance(target, tk.Canvas):
-        if _rects.shape != (FIELD_HEIGHT, FIELD_WIDTH):
-            _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
-        for y in range(FIELD_HEIGHT):
-            for x in range(FIELD_WIDTH):
-                cell_bounds = get_cell_bounds(x, y)
-                color = f'#{display_colors[y, x][0]:02x}{display_colors[y, x][1]:02x}{display_colors[y, x][2]:02x}'
-                if _rects[y][x] == 0:
-                    _rects[y][x] = target.create_rectangle(
-                        cell_bounds[0][0], cell_bounds[0][1],
-                        cell_bounds[1][0], cell_bounds[1][1],
-                        fill=color, outline="gray", width=_cell_border,
-                    )
-                else:
-                    target.itemconfigure(int(_rects[y][x]), fill=color)
-
+    canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
+    target.set_grid_data(
+        display_colors,
+        (FIELD_WIDTH, FIELD_HEIGHT),
+        (float(_cell_width), float(_cell_height)),
+        float(_cell_border),
+        (float(canvas_size[0]), float(canvas_size[1])),
+    )
 
 def add_to_cell(x: int, y: int, value: Any):
     """Adds value to cell (x, y) and immediately updates _grid_colors in O(1)."""
@@ -1059,7 +1036,7 @@ def create_window():
 
 if __name__ == "__main__":
     _root_window, _frame, _canvas = create_window()
-    draw_grid(_canvas)
+    draw_grid()
     populate_cells(0.7, True, _canvas)
     _frame.pack()
     _root_window.mainloop()
