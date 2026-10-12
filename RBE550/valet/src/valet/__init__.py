@@ -1,9 +1,20 @@
 from valet import obstacle_field
-from valet.obstacle_field import ObstacleFieldWidget, create_window, draw_grid, populate_cells
+from valet.obstacle_field import (
+    DrawableGroup,
+    DrawableRect,
+    ObstacleFieldWidget,
+    TF2DOwner,
+    create_window,
+    draw_grid,
+    populate_cells,
+)
 
 __all__ = [
     "obstacle_field",
     "ObstacleFieldWidget",
+    "TF2DOwner",
+    "DrawableRect",
+    "DrawableGroup",
     "create_window",
     "draw_grid",
     "populate_cells",

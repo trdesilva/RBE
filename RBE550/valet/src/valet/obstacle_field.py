@@ -2,6 +2,8 @@
 
 Replaces the Tkinter Canvas object with an OpenGL-backed widget (ObstacleFieldWidget)
 using pyopengltk and PyOpenGL for hardware-accelerated grid rendering.
+Optimized with pure vectorized NumPy operations to eliminate Python for-loops.
+Includes support for transformed 2D shapes (TF2DOwner, DrawableRect, DrawableGroup).
 """
 
 from __future__ import annotations
@@ -26,9 +28,7 @@ _rng = np.random.default_rng()
 _cells: list[list[list[Any]]] = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
 _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
 _bg_rects: list[Any] = []
-_dirty_cells: list[tuple[tuple[int, int], list[Any]]] = [
-    ((x, y), []) for y in range(FIELD_HEIGHT) for x in range(FIELD_WIDTH)
-]
+_dirty_cells: list[tuple[tuple[int, int], list[Any]]] = []
 _fill_func = lambda value: 'black' if value is not None and len(value) > 0 and value[0] > 0 else 'white'
 
 _cell_width = 6
@@ -120,11 +120,370 @@ void main() {
 }
 """
 
+# GLSL Shaders for rendering transformed overlay shapes
+_SHAPE_VERT_SRC = """
+#version 120
+attribute vec2 a_pos;
+void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+"""
+
+_SHAPE_FRAG_SRC = """
+#version 120
+uniform vec4 u_color;
+void main() {
+    gl_FragColor = u_color;
+}
+"""
+
+
+def parse_color_rgba(color: Any, default_alpha: float = 1.0) -> tuple[float, float, float, float]:
+    """
+    Parses a color specified as RGBA tuple, RGB tuple, hex string, or named color
+    into an (r, g, b, a) tuple of floats in [0.0, 1.0].
+    """
+    if color is None:
+        return (0.0, 0.0, 0.0, 0.0)
+
+    if isinstance(color, (tuple, list, np.ndarray)):
+        arr = list(color)
+        if len(arr) >= 4:
+            r = arr[0] / 255.0 if arr[0] > 1.0 else float(arr[0])
+            g = arr[1] / 255.0 if arr[1] > 1.0 else float(arr[1])
+            b = arr[2] / 255.0 if arr[2] > 1.0 else float(arr[2])
+            a = arr[3] / 255.0 if arr[3] > 1.0 else float(arr[3])
+            return (r, g, b, a)
+        elif len(arr) >= 3:
+            r = arr[0] / 255.0 if arr[0] > 1.0 else float(arr[0])
+            g = arr[1] / 255.0 if arr[1] > 1.0 else float(arr[1])
+            b = arr[2] / 255.0 if arr[2] > 1.0 else float(arr[2])
+            return (r, g, b, default_alpha)
+
+    if isinstance(color, str):
+        text = color.strip()
+        if text.startswith('#') and len(text) == 9:  # #rrggbbaa
+            r = int(text[1:3], 16) / 255.0
+            g = int(text[3:5], 16) / 255.0
+            b = int(text[5:7], 16) / 255.0
+            a = int(text[7:9], 16) / 255.0
+            return (r, g, b, a)
+        rgb = convert_text_to_rgb(text)
+        return (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, default_alpha)
+
+    return (0.0, 0.0, 0.0, default_alpha)
+
+
+class TF2DOwner:
+    """
+    Base class representing an entity with a 2D rigid transform (translation x, y
+    and heading theta in radians). Supports hierarchical parent-child transforms.
+    """
+    def __init__(
+        self,
+        x: float = 0.0,
+        y: float = 0.0,
+        theta: float = 0.0,
+        parent: TF2DOwner | None = None,
+    ):
+        self.x = float(x)
+        self.y = float(y)
+        self.theta = float(theta)  # in radians
+        self.parent = parent
+
+    @property
+    def degrees(self) -> float:
+        """Rotation angle in degrees."""
+        return float(np.degrees(self.theta))
+
+    @degrees.setter
+    def degrees(self, val: float):
+        self.theta = float(np.radians(val))
+
+    def set_pose(self, x: float, y: float, theta: float | None = None):
+        """Sets the position and optional heading."""
+        self.x = float(x)
+        self.y = float(y)
+        if theta is not None:
+            self.theta = float(theta)
+
+    def translate(self, dx: float, dy: float):
+        """Translates the transform by (dx, dy)."""
+        self.x += float(dx)
+        self.y += float(dy)
+
+    def rotate(self, dtheta: float):
+        """Rotates the transform by dtheta radians."""
+        self.theta += float(dtheta)
+
+    def get_local_transform_matrix(self) -> np.ndarray:
+        """
+        Returns the 3x3 homogeneous transformation matrix for this local pose:
+        [[cos(theta), -sin(theta), x],
+         [sin(theta),  cos(theta), y],
+         [         0,           0, 1]]
+        """
+        c = np.cos(self.theta)
+        s = np.sin(self.theta)
+        return np.array([
+            [c, -s, self.x],
+            [s,  c, self.y],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+    def get_world_transform_matrix(self) -> np.ndarray:
+        """Recursively computes the world transform matrix by chaining parent transforms."""
+        local = self.get_local_transform_matrix()
+        if self.parent is not None:
+            return self.parent.get_world_transform_matrix() @ local
+        return local
+
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        """
+        Transforms an (N, 2) array of local points into world coordinates
+        using the world transformation matrix.
+        """
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.ndim == 1:
+            pts = pts.reshape(1, 2)
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        h_pts = np.hstack([pts, ones])  # (N, 3)
+        m = self.get_world_transform_matrix()  # (3, 3)
+        world_h = h_pts @ m.T
+        return world_h[:, :2]
+
+
+class DrawableRect(TF2DOwner):
+    """
+    A transformable 2D rectangle drawable on the grid or in screen pixels.
+    """
+    def __init__(
+        self,
+        x: float = 0.0,
+        y: float = 0.0,
+        width: float = 1.0,
+        height: float = 1.0,
+        theta: float = 0.0,
+        origin: tuple[float, float] = (0.5, 0.5),  # (0.5, 0.5) is centered at (x, y)
+        fill_color: Any = (1.0, 0.0, 0.0, 1.0),
+        border_color: Any = None,
+        border_width: float = 1.0,
+        coordinate_frame: str = "grid",  # "grid" or "pixel"
+        visible: bool = True,
+        parent: TF2DOwner | None = None,
+    ):
+        super().__init__(x=x, y=y, theta=theta, parent=parent)
+        self.width = float(width)
+        self.height = float(height)
+        self.origin = (float(origin[0]), float(origin[1]))
+        self.fill_color = fill_color
+        self.border_color = border_color
+        self.border_width = float(border_width)
+        self.coordinate_frame = coordinate_frame
+        self.visible = visible
+
+    def get_local_vertices(self) -> np.ndarray:
+        """
+        Returns the 4 local vertices of the rectangle relative to its pose origin:
+        [top-left, top-right, bottom-right, bottom-left].
+        """
+        ox, oy = self.origin
+        x0 = -ox * self.width
+        x1 = (1.0 - ox) * self.width
+        y0 = -oy * self.height
+        y1 = (1.0 - oy) * self.height
+        return np.array([
+            [x0, y0],
+            [x1, y0],
+            [x1, y1],
+            [x0, y1],
+        ], dtype=np.float64)
+
+    def get_world_vertices(self) -> np.ndarray:
+        """Transforms local vertices into world (grid or root parent) coordinates."""
+        return self.transform_points(self.get_local_vertices())
+
+
+class DrawableGroup(TF2DOwner):
+    """
+    A composite collection of DrawableRects and nested DrawableGroups that share
+    a common 2D coordinate transform.
+    """
+    def __init__(
+        self,
+        x: float = 0.0,
+        y: float = 0.0,
+        theta: float = 0.0,
+        visible: bool = True,
+        parent: TF2DOwner | None = None,
+    ):
+        super().__init__(x=x, y=y, theta=theta, parent=parent)
+        self.children: list[DrawableRect | DrawableGroup] = []
+        self.visible = visible
+
+    def add(self, drawable: DrawableRect | DrawableGroup):
+        """Adds a child drawable to this group and binds this group as its parent."""
+        if drawable not in self.children:
+            self.children.append(drawable)
+            drawable.parent = self
+
+    def remove(self, drawable: DrawableRect | DrawableGroup):
+        """Removes a child drawable from this group."""
+        if drawable in self.children:
+            self.children.remove(drawable)
+            if drawable.parent is self:
+                drawable.parent = None
+
+    def clear(self):
+        """Removes all children from this group."""
+        for child in self.children:
+            if child.parent is self:
+                child.parent = None
+        self.children.clear()
+
+    def get_all_rects(self) -> list[DrawableRect]:
+        """Recursively collects all visible DrawableRect leaves in this group."""
+        if not self.visible:
+            return []
+        rects: list[DrawableRect] = []
+        for child in self.children:
+            if isinstance(child, DrawableRect):
+                if child.visible:
+                    rects.append(child)
+            elif isinstance(child, DrawableGroup):
+                rects.extend(child.get_all_rects())
+        return rects
+
+    def __iter__(self):
+        return iter(self.children)
+
+    def __len__(self) -> int:
+        return len(self.children)
+
+
+def vectorized_hue_to_rgb(hue_percent: np.ndarray) -> np.ndarray:
+    """
+    Pure NumPy vectorized HSV to RGB conversion for hue_percent in [0, 1]
+    mapped to hue in [120/360, 0] (Green to Red), with saturation=1.0, value=1.0.
+    Returns an (N, 3) uint8 array of RGB colors in [0, 255].
+    """
+    hp = np.asarray(hue_percent, dtype=np.float32)
+    h = (1.0 - hp) * (120.0 / 360.0) * 6.0  # h in [0, 2]
+    r = np.clip(np.where(h <= 1.0, 1.0, 2.0 - h), 0.0, 1.0)
+    g = np.clip(np.where(h <= 1.0, h, 1.0), 0.0, 1.0)
+    b = np.zeros_like(h)
+    return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+
+
+class GridBackgroundMap:
+    """
+    High-performance 2D NumPy array-backed map for cell background values.
+    Provides a dictionary-like interface (indexing, get, pop, clear, contains, items)
+    while storing values in a contiguous (height, width) float32 array for zero-copy
+    vectorized operations.
+    """
+    def __init__(self, width: int = FIELD_WIDTH, height: int = FIELD_HEIGHT):
+        self.width = width
+        self.height = height
+        self.grid = np.full((height, width), np.nan, dtype=np.float32)
+
+    def _ensure_dimensions(self, width: int, height: int):
+        if self.width != width or self.height != height or self.grid.shape != (height, width):
+            new_grid = np.full((height, width), np.nan, dtype=np.float32)
+            common_h = min(self.height, height)
+            common_w = min(self.width, width)
+            new_grid[:common_h, :common_w] = self.grid[:common_h, :common_w]
+            self.grid = new_grid
+            self.width = width
+            self.height = height
+
+    def __setitem__(self, key: tuple[int, int], value: float):
+        x, y = key
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            self._ensure_dimensions(max(self.width, x + 1), max(self.height, y + 1))
+        self.grid[y, x] = float(value)
+
+    def __getitem__(self, key: tuple[int, int]) -> float:
+        x, y = key
+        if 0 <= x < self.width and 0 <= y < self.height:
+            v = self.grid[y, x]
+            if not np.isnan(v):
+                return float(v)
+        raise KeyError(key)
+
+    def get(self, key: tuple[int, int], default: Any = None) -> Any:
+        x, y = key
+        if 0 <= x < self.width and 0 <= y < self.height:
+            v = self.grid[y, x]
+            if not np.isnan(v):
+                return float(v)
+        return default
+
+    def pop(self, key: tuple[int, int], default: Any = None) -> Any:
+        x, y = key
+        if 0 <= x < self.width and 0 <= y < self.height:
+            v = self.grid[y, x]
+            if not np.isnan(v):
+                self.grid[y, x] = np.nan
+                return float(v)
+        return default
+
+    def clear(self):
+        self.grid.fill(np.nan)
+
+    def __contains__(self, key: tuple[int, int]) -> bool:
+        x, y = key
+        if 0 <= x < self.width and 0 <= y < self.height:
+            return not np.isnan(self.grid[y, x])
+        return False
+
+    def __len__(self) -> int:
+        return int(np.count_nonzero(~np.isnan(self.grid)))
+
+    def items(self):
+        ys, xs = np.nonzero(~np.isnan(self.grid))
+        for y, x in zip(ys, xs):
+            yield (int(x), int(y)), float(self.grid[y, x])
+
+    def keys(self):
+        ys, xs = np.nonzero(~np.isnan(self.grid))
+        for y, x in zip(ys, xs):
+            yield (int(x), int(y))
+
+    def values(self):
+        vals = self.grid[~np.isnan(self.grid)]
+        for v in vals:
+            yield float(v)
+
+
+class AdaptiveGradientBackground:
+    """
+    Background to pass to draw_grid that can scale get_gradient to a range of values.
+    Uses GridBackgroundMap for O(1) cell access and pure vectorized blending in draw_grid.
+    """
+    def __init__(self, width: int = FIELD_WIDTH, height: int = FIELD_HEIGHT):
+        self.cell_map = GridBackgroundMap(width, height)
+        self.value_cache: np.ndarray | None = None
+
+    def fill_func(self, value):
+        if self.value_cache is None:
+            if isinstance(self.cell_map, GridBackgroundMap):
+                active = self.cell_map.grid[~np.isnan(self.cell_map.grid)]
+            else:
+                active = np.array(list(self.cell_map.values()))
+            if active.size > 0:
+                self.value_cache = np.histogram_bin_edges(np.sort(active), 10)
+            else:
+                self.value_cache = np.array([0.0, 1.0])
+        normalized = np.searchsorted(self.value_cache, value) / self.value_cache.size
+        return get_hsv_gradient(float(normalized), 1.0)
+
 
 class ObstacleFieldWidget(OpenGLFrame):
     """
     OpenGL-accelerated Tkinter widget replacing the Tkinter Canvas.
-    Draws the grid of cells and borders in parallel on the GPU.
+    Draws the grid of cells and borders in parallel on the GPU, and renders
+    collections of transformed shapes (DrawableRect, DrawableGroup) over the grid.
     """
     def __init__(self, master=None, **kw):
         width = kw.get('width', 800)
@@ -133,11 +492,16 @@ class ObstacleFieldWidget(OpenGLFrame):
         self.height = int(height)
         super().__init__(master, **kw)
 
+        # Shaders & Buffers
         self.prog = None
         self.tex = None
         self.quad_vbo = None
         self._tex_dims: tuple[int, int] | None = None
 
+        self.shape_prog = None
+        self.shape_vbo = None
+
+        # Grid data
         self.texture_data: np.ndarray | None = None
         self.texture_needs_upload = False
 
@@ -147,10 +511,55 @@ class ObstacleFieldWidget(OpenGLFrame):
         self.canvas_size = (float(self.width), float(self.height))
         self.border_color = (0.5, 0.5, 0.5, 1.0)
 
+        # Collection of overlay drawables
+        self.drawables: list[DrawableRect | DrawableGroup] = []
+
+    def add_drawable(self, drawable: DrawableRect | DrawableGroup):
+        """Adds a drawable shape or group to the overlay collection."""
+        if drawable not in self.drawables:
+            self.drawables.append(drawable)
+
+    def remove_drawable(self, drawable: DrawableRect | DrawableGroup):
+        """Removes a drawable shape or group from the overlay collection."""
+        if drawable in self.drawables:
+            self.drawables.remove(drawable)
+
+    def clear_drawables(self):
+        """Removes all drawable shapes and groups from the overlay collection."""
+        self.drawables.clear()
+
+    def grid_to_pixel(self, points: np.ndarray) -> np.ndarray:
+        """
+        Converts (N, 2) grid coordinates to window screen pixels:
+        px = 2 * cell_border + gx * (cell_width + cell_border)
+        py = 2 * cell_border + gy * (cell_height + cell_border)
+        """
+        pts = np.asarray(points, dtype=np.float64)
+        margin = 2.0 * self.cell_border
+        stride_x = self.cell_size[0] + self.cell_border
+        stride_y = self.cell_size[1] + self.cell_border
+        px = margin + pts[:, 0] * stride_x
+        py = margin + pts[:, 1] * stride_y
+        return np.column_stack([px, py])
+
+    def pixel_to_ndc(self, pixels: np.ndarray) -> np.ndarray:
+        """
+        Converts (N, 2) window screen pixel coordinates to OpenGL NDC [-1, 1]:
+        X_ndc = (2 * px / viewport_width) - 1.0
+        Y_ndc = 1.0 - (2 * py / viewport_height)
+        """
+        pts = np.asarray(pixels, dtype=np.float64)
+        vw = max(float(self.width), 1.0)
+        vh = max(float(self.height), 1.0)
+        ndc_x = (2.0 * pts[:, 0] / vw) - 1.0
+        ndc_y = 1.0 - (2.0 * pts[:, 1] / vh)
+        return np.column_stack([ndc_x, ndc_y])
+
     def initgl(self):
-        """Initializes OpenGL viewport, shaders, VBO, and textures."""
+        """Initializes OpenGL viewport, shaders, VBOs, and textures."""
         GL.glViewport(0, 0, self.width, self.height)
 
+        # 1. Grid pass shaders & quad
         if self.prog is None:
             vert = shaders.compileShader(_VERT_SRC, GL.GL_VERTEX_SHADER)
             frag = shaders.compileShader(_FRAG_SRC, GL.GL_FRAGMENT_SHADER)
@@ -169,6 +578,15 @@ class ObstacleFieldWidget(OpenGLFrame):
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+
+        # 2. Shape overlay shader & buffer
+        if self.shape_prog is None:
+            s_vert = shaders.compileShader(_SHAPE_VERT_SRC, GL.GL_VERTEX_SHADER)
+            s_frag = shaders.compileShader(_SHAPE_FRAG_SRC, GL.GL_FRAGMENT_SHADER)
+            self.shape_prog = shaders.compileProgram(s_vert, s_frag)
+
+        if self.shape_vbo is None:
+            self.shape_vbo = GL.glGenBuffers(1)
 
         if self.texture_data is not None:
             self._upload_texture()
@@ -214,9 +632,15 @@ class ObstacleFieldWidget(OpenGLFrame):
         self.tkSwapBuffers()
 
     def redraw(self):
-        """Draws the grid in a single GPU pass using the fragment shader."""
+        """
+        Draws the grid in Pass 1, followed by all transformed overlay shapes in Pass 2.
+        """
         if self.prog is None:
             return
+
+        # -------------------------------------------------------------
+        # PASS 1: Render background occupancy grid & borders
+        # -------------------------------------------------------------
         GL.glClearColor(self.border_color[0], self.border_color[1], self.border_color[2], 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         GL.glUseProgram(self.prog)
@@ -242,6 +666,62 @@ class ObstacleFieldWidget(OpenGLFrame):
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glDisableVertexAttribArray(loc)
 
+        # -------------------------------------------------------------
+        # PASS 2: Render transformed overlay shapes (DrawableRects)
+        # -------------------------------------------------------------
+        if self.drawables and self.shape_prog is not None:
+            rects: list[DrawableRect] = []
+            for item in self.drawables:
+                if isinstance(item, DrawableRect):
+                    if item.visible:
+                        rects.append(item)
+                elif isinstance(item, DrawableGroup):
+                    rects.extend(item.get_all_rects())
+
+            if rects:
+                GL.glEnable(GL.GL_BLEND)
+                GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+                GL.glUseProgram(self.shape_prog)
+
+                loc_pos = GL.glGetAttribLocation(self.shape_prog, 'a_pos')
+                loc_col = GL.glGetUniformLocation(self.shape_prog, 'u_color')
+                GL.glEnableVertexAttribArray(loc_pos)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.shape_vbo)
+
+                for rect in rects:
+                    world_pts = rect.get_world_vertices()  # (4, 2)
+                    if rect.coordinate_frame == "grid":
+                        pixel_pts = self.grid_to_pixel(world_pts)
+                    else:
+                        pixel_pts = world_pts
+                    ndc_pts = self.pixel_to_ndc(pixel_pts)  # (4, 2)
+
+                    # Filled quad (2 triangles: 0-1-2 and 0-2-3)
+                    fill_rgba = parse_color_rgba(rect.fill_color)
+                    if fill_rgba[3] > 0.0:
+                        tri_verts = np.array([
+                            ndc_pts[0], ndc_pts[1], ndc_pts[2],
+                            ndc_pts[0], ndc_pts[2], ndc_pts[3],
+                        ], dtype=np.float32)
+                        GL.glUniform4f(loc_col, *fill_rgba)
+                        GL.glBufferData(GL.GL_ARRAY_BUFFER, tri_verts.nbytes, tri_verts, GL.GL_DYNAMIC_DRAW)
+                        GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+                        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
+
+                    # Outline border (line loop: 0-1-2-3)
+                    if rect.border_color is not None and rect.border_width > 0.0:
+                        border_rgba = parse_color_rgba(rect.border_color)
+                        if border_rgba[3] > 0.0:
+                            line_verts = np.asarray(ndc_pts, dtype=np.float32)
+                            GL.glLineWidth(max(1.0, float(rect.border_width)))
+                            GL.glUniform4f(loc_col, *border_rgba)
+                            GL.glBufferData(GL.GL_ARRAY_BUFFER, line_verts.nbytes, line_verts, GL.GL_DYNAMIC_DRAW)
+                            GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+                            GL.glDrawArrays(GL.GL_LINE_LOOP, 0, 4)
+
+                GL.glDisableVertexAttribArray(loc_pos)
+                GL.glDisable(GL.GL_BLEND)
+
     # Tkinter Canvas compatibility stubs
     def create_rectangle(self, *args, **kwargs):
         return 1
@@ -256,23 +736,6 @@ class ObstacleFieldWidget(OpenGLFrame):
 # Aliases
 OpenGLGridWidget = ObstacleFieldWidget
 ObstacleFieldGLWidget = ObstacleFieldWidget
-
-
-class AdaptiveGradientBackground:
-    """
-    Background to pass to draw_grid that can scale get_gradient to a range of values. Put cells to be colored in cell_map
-    and set value_cache to None when the gradient range needs to be updated.
-    """
-    def __init__(self):
-        self.cell_map: dict[tuple[int, int], float] = {}
-        self.value_cache: np.ndarray | None = None
-
-    def fill_func(self, value):
-        if self.value_cache is None:
-            self.value_cache = np.sort(np.array(list(self.cell_map.values())))
-            self.value_cache = np.histogram_bin_edges(self.value_cache, 10)
-        normalized = np.searchsorted(self.value_cache, value) / self.value_cache.size
-        return get_hsv_gradient(float(normalized), 1.0)
 
 
 def get_basic_tetrominoes():
@@ -328,6 +791,18 @@ def get_all_tetrominoes():
     return tetrominoes
 
 
+def _sync_grid_colors_from_cells():
+    """Synchronizes _grid_colors from _cells matrix."""
+    global _grid_colors
+    empty_rgb = convert_text_to_rgb(_fill_func([]))
+    _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), empty_rgb, dtype=np.uint8)
+    for y in range(min(len(_cells), FIELD_HEIGHT)):
+        row = _cells[y]
+        for x in range(min(len(row), FIELD_WIDTH)):
+            if len(row[x]) > 0:
+                _grid_colors[y, x] = convert_text_to_rgb(_fill_func(row[x]))
+
+
 def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
     """
     :param coverage: approximate percentage of cells that should be occupied, on [0, 1]
@@ -339,7 +814,10 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
     global _cells, _dirty_cells, _rects, _grid_colors
     _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
     _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
-    _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), 255, dtype=np.uint8)
+    _dirty_cells.clear()
+
+    empty_rgb = convert_text_to_rgb(_fill_func([]))
+    _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), empty_rgb, dtype=np.uint8)
 
     tetrominoes = get_all_tetrominoes() if use_all_tets else get_basic_tetrominoes()
     total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
@@ -351,14 +829,19 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
         x = _rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
         y = _rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
         for i in np.ndindex(tet_bounds):
-            cell = _cells[y + i[0]][x + i[1]]
             if tet_cells[i] == 1:
+                cy, cx = y + i[0], x + i[1]
+                cell = _cells[cy][cx]
                 if len(cell) > 0:
-                    _cells[y + i[0]][x + i[1]][0] = tet_cells[i]
+                    cell[0] = tet_cells[i]
                 else:
-                    _cells[y + i[0]][x + i[1]].append(tet_cells[i])
+                    cell.append(tet_cells[i])
 
-    _dirty_cells = [((x, y), _cells[y][x]) for y in range(FIELD_HEIGHT) for x in range(FIELD_WIDTH)]
+    # Vectorized color assignment for occupied cells
+    wall_rgb = convert_text_to_rgb(_fill_func([1]))
+    occupied = np.array([[len(c) > 0 and c[0] > 0 for c in row] for row in _cells], dtype=bool)
+    _grid_colors[occupied] = wall_rgb
+
     if canvas is not None:
         draw_grid(canvas)
 
@@ -443,51 +926,82 @@ def get_threshold(v: float, threshold: float) -> str:
     return "#000000" if v > threshold else "#ffffff"
 
 
+def _apply_vectorized_background(base_colors: np.ndarray, background: AdaptiveGradientBackground) -> np.ndarray:
+    """
+    Applies background gradient overlays onto base_colors using pure NumPy vectorized operations.
+    Eliminates all scalar Python iteration.
+    """
+    cell_map = background.cell_map
+    if isinstance(cell_map, GridBackgroundMap):
+        cell_map._ensure_dimensions(FIELD_WIDTH, FIELD_HEIGHT)
+        mask = ~np.isnan(cell_map.grid)
+        if not np.any(mask):
+            return base_colors
+
+        active_vals = cell_map.grid[mask]
+        if background.value_cache is None:
+            background.value_cache = np.histogram_bin_edges(np.sort(active_vals), 10)
+
+        norm = np.searchsorted(background.value_cache, active_vals) / background.value_cache.size
+        bg_rgb = vectorized_hue_to_rgb(norm)
+
+        display_colors = base_colors.copy()
+        base_masked = display_colors[mask].astype(np.float32)
+        display_colors[mask] = (0.75 * base_masked + 0.25 * bg_rgb.astype(np.float32)).astype(np.uint8)
+        return display_colors
+
+    elif isinstance(cell_map, dict) and cell_map:
+        coords = list(cell_map.keys())
+        xs = np.fromiter((c[0] for c in coords), dtype=int, count=len(coords))
+        ys = np.fromiter((c[1] for c in coords), dtype=int, count=len(coords))
+        vals = np.fromiter(cell_map.values(), dtype=np.float32, count=len(coords))
+
+        valid = (xs >= 0) & (xs < FIELD_WIDTH) & (ys >= 0) & (ys < FIELD_HEIGHT)
+        if not np.any(valid):
+            return base_colors
+
+        xs, ys, vals = xs[valid], ys[valid], vals[valid]
+        if background.value_cache is None:
+            background.value_cache = np.histogram_bin_edges(np.sort(vals), 10)
+
+        norm = np.searchsorted(background.value_cache, vals) / background.value_cache.size
+        bg_rgb = vectorized_hue_to_rgb(norm)
+
+        display_colors = base_colors.copy()
+        base_masked = display_colors[ys, xs].astype(np.float32)
+        display_colors[ys, xs] = (0.75 * base_masked + 0.25 * bg_rgb.astype(np.float32)).astype(np.uint8)
+        return display_colors
+
+    return base_colors
+
+
 def draw_grid(canvas=None, background: AdaptiveGradientBackground | None = None):
     """
     Renders the occupancy grid onto the OpenGL widget (or legacy Tkinter Canvas).
+    Completely eliminates Python for-loops by relying on O(1) cell updates and NumPy vectorization.
     """
     global _dirty_cells, _rects, _bg_rects, _grid_colors, _active_widget
     target = canvas if canvas is not None else _active_widget
 
     # Ensure color array matches field dimensions
     if _grid_colors is None or _grid_colors.shape[0] != FIELD_HEIGHT or _grid_colors.shape[1] != FIELD_WIDTH:
-        _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), 255, dtype=np.uint8)
+        _sync_grid_colors_from_cells()
 
-    # Process dirty cells into _grid_colors
-    for (coords, values) in _dirty_cells:
-        x, y = coords
-        if 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
-            color = _fill_func(values)
-            _grid_colors[y, x] = convert_text_to_rgb(color)
-    _dirty_cells.clear()
+    # Apply background overlay vectorially if requested
+    display_colors = _grid_colors
+    if background is not None:
+        display_colors = _apply_vectorized_background(display_colors, background)
 
     # GPU-accelerated rendering path via ObstacleFieldWidget
     if isinstance(target, ObstacleFieldWidget):
         canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
-        if background is not None:
-            display_colors = _grid_colors.copy()
-            for (coords, value) in background.cell_map.items():
-                x, y = coords
-                if 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
-                    current_rgb = display_colors[y, x].astype(np.float32)
-                    bg_rgb = np.array(convert_text_to_rgb(background.fill_func(value)), dtype=np.float32)
-                    display_colors[y, x] = np.clip(0.75 * current_rgb + 0.25 * bg_rgb, 0, 255).astype(np.uint8)
-            target.set_grid_data(
-                display_colors,
-                (FIELD_WIDTH, FIELD_HEIGHT),
-                (float(_cell_width), float(_cell_height)),
-                float(_cell_border),
-                (float(canvas_size[0]), float(canvas_size[1])),
-            )
-        else:
-            target.set_grid_data(
-                _grid_colors,
-                (FIELD_WIDTH, FIELD_HEIGHT),
-                (float(_cell_width), float(_cell_height)),
-                float(_cell_border),
-                (float(canvas_size[0]), float(canvas_size[1])),
-            )
+        target.set_grid_data(
+            display_colors,
+            (FIELD_WIDTH, FIELD_HEIGHT),
+            (float(_cell_width), float(_cell_height)),
+            float(_cell_border),
+            (float(canvas_size[0]), float(canvas_size[1])),
+        )
         return
 
     # Fallback path for legacy Tkinter Canvas
@@ -497,7 +1011,7 @@ def draw_grid(canvas=None, background: AdaptiveGradientBackground | None = None)
         for y in range(FIELD_HEIGHT):
             for x in range(FIELD_WIDTH):
                 cell_bounds = get_cell_bounds(x, y)
-                color = f'#{_grid_colors[y, x][0]:02x}{_grid_colors[y, x][1]:02x}{_grid_colors[y, x][2]:02x}'
+                color = f'#{display_colors[y, x][0]:02x}{display_colors[y, x][1]:02x}{display_colors[y, x][2]:02x}'
                 if _rects[y][x] == 0:
                     _rects[y][x] = target.create_rectangle(
                         cell_bounds[0][0], cell_bounds[0][1],
@@ -507,33 +1021,21 @@ def draw_grid(canvas=None, background: AdaptiveGradientBackground | None = None)
                 else:
                     target.itemconfigure(int(_rects[y][x]), fill=color)
 
-        if background is not None:
-            target.delete(*_bg_rects)
-            _bg_rects.clear()
-            for (coords, value) in background.cell_map.items():
-                x, y = coords
-                cell_bounds = get_cell_bounds(x, y)
-                current_color_rgb = _grid_colors[y, x]
-                bg_color_rgb = convert_text_to_rgb(background.fill_func(value))
-                adjusted_color_rgb = np.add(0.75 * np.array([*current_color_rgb]), 0.25 * np.array([*bg_color_rgb]))
-                _bg_rects.append(target.create_rectangle(
-                    cell_bounds[0][0], cell_bounds[0][1],
-                    cell_bounds[1][0], cell_bounds[1][1],
-                    fill=f'#{int(adjusted_color_rgb[0]):02x}{int(adjusted_color_rgb[1]):02x}{int(adjusted_color_rgb[2]):02x}',
-                    outline="gray", width=_cell_border,
-                ))
-
 
 def add_to_cell(x: int, y: int, value: Any):
-    global _cells, _dirty_cells
+    """Adds value to cell (x, y) and immediately updates _grid_colors in O(1)."""
+    global _cells, _grid_colors
     _cells[y][x].append(value)
-    _dirty_cells.append(((x, y), list(_cells[y][x])))
+    if _grid_colors is not None and 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
+        _grid_colors[y, x] = convert_text_to_rgb(_fill_func(_cells[y][x]))
 
 
 def remove_from_cell(x: int, y: int, value: Any):
-    global _cells, _dirty_cells
+    """Removes value from cell (x, y) and immediately updates _grid_colors in O(1)."""
+    global _cells, _grid_colors
     _cells[y][x].remove(value)
-    _dirty_cells.append(((x, y), list(_cells[y][x])))
+    if _grid_colors is not None and 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
+        _grid_colors[y, x] = convert_text_to_rgb(_fill_func(_cells[y][x]))
 
 
 def get_cells_copy() -> list[list[list[Any]]]:

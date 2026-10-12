@@ -405,7 +405,7 @@ def step_time():
             print(f'Collisions: {perf2 - perf1}')
             perf1 = perf2
 
-        obs.draw_grid(canvas, background=_hero.path_bg if _hero is not None and should_draw_bg() else None)
+        obs.draw_grid(background=_hero.path_bg if _hero is not None and should_draw_bg() else None)
         if __debug__:
             perf2 = time.perf_counter_ns()
             print(f'Drawing: {perf2 - perf1}')
@@ -457,7 +457,7 @@ if __name__ == "__main__":
     obs._fill_func = get_fill_color
     root_window, frame, canvas = obs.create_window()
     root_window.title("Flatland")
-    obs.draw_grid(canvas)
+    obs.draw_grid()
     obs.populate_cells(COVERAGE, True, canvas)
 
     # create units
@@ -478,6 +478,6 @@ if __name__ == "__main__":
     heur_cbox = ttk.Checkbutton(frame, text='Draw Heuristics', variable=_should_draw_heur_bg)
     heur_cbox.grid(row=3, column=3)
 
-    obs.draw_grid(canvas)
+    obs.draw_grid()
     frame.pack()
     root_window.mainloop()
