@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module external.system.id="pyproject.toml" type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$/valet">
+      <sourceFolder url="file://$MODULE_DIR$/valet/src" />
+      <excludeFolder url="file://$MODULE_DIR$/valet/.venv" />
+    </content>
+    <orderEntry type="jdk" jdkName="~\src\RBE\RBE550\valet\.venv" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

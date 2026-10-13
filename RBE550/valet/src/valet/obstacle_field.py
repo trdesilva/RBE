@@ -178,13 +178,12 @@ class TF2DOwner:
     Base class representing an entity with a 2D rigid transform (translation x, y
     and heading theta in radians). Supports hierarchical parent-child transforms.
     """
-    def __init__(
-        self,
-        x: float = 0.0,
-        y: float = 0.0,
-        theta: float = 0.0,
-        parent: TF2DOwner | None = None,
-    ):
+    def __init__(self,
+                 x: float = 0.0,
+                 y: float = 0.0,
+                 theta: float = 0.0,
+                 parent: TF2DOwner | None = None
+                 ):
         self.x = float(x)
         self.y = float(y)
         self.theta = float(theta)  # in radians
@@ -243,12 +242,16 @@ class TF2DOwner:
         using the world transformation matrix.
         """
         pts = np.asarray(points, dtype=np.float64)
+        print(f'pts {pts}')
         if pts.ndim == 1:
             pts = pts.reshape(1, 2)
         ones = np.ones((pts.shape[0], 1), dtype=np.float64)
         h_pts = np.hstack([pts, ones])  # (N, 3)
+        print(f'h_pts {h_pts}')
         m = self.get_world_transform_matrix()  # (3, 3)
+        print(f'm {m}')
         world_h = h_pts @ m.T
+        print(f'world_h {world_h}')
         return world_h[:, :2]
 
 
@@ -478,18 +481,19 @@ class AdaptiveGradientBackground:
         return get_hsv_gradient(float(normalized), 1.0)
 
 
-class ObstacleFieldWidget(OpenGLFrame):
+class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
     """
     OpenGL-accelerated Tkinter widget replacing the Tkinter Canvas.
     Draws the grid of cells and borders in parallel on the GPU, and renders
     collections of transformed shapes (DrawableRect, DrawableGroup) over the grid.
     """
     def __init__(self, master=None, **kw):
+        super().__init__()
         width = kw.get('width', 800)
         height = kw.get('height', 800)
         self.width = int(width)
         self.height = int(height)
-        super().__init__(master, **kw)
+        super(TF2DOwner, self).__init__(master, **kw)
 
         # Shaders & Buffers
         self.prog = None
@@ -802,13 +806,13 @@ def _sync_grid_colors_from_cells():
                 _grid_colors[y, x] = convert_text_to_rgb(_fill_func(row[x]))
 
 
-def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
+def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
     """
     :param coverage: approximate percentage of cells that should be occupied, on [0, 1]
     (tetrominoes may overlap so coverage is an upper bound)
     :param use_all_tets: if true, use all possible tetrominoes instead of just the ones on the assignment doc
     :param canvas: the canvas/widget to draw on
-    :return: None
+    :return: A dictionary mapping (x, y) coordinate pairs to tetromino cell arrays placed there
     """
     global _cells, _rects, _grid_colors
     _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
@@ -821,6 +825,7 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
     total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
     print(f'Placing {total} tetrominoes...')
     tets_to_place = _rng.integers(len(tetrominoes), size=total)
+    placed_coords = {}
     for tet in tets_to_place:
         tet_cells = tetrominoes[tet]
         tet_bounds = np.shape(tet_cells)
@@ -835,6 +840,8 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
                 else:
                     cell.append(tet_cells[i])
 
+        placed_coords[(x, y)] = tet_cells
+
     # Vectorized color assignment for occupied cells
     wall_rgb = convert_text_to_rgb(_fill_func([1]))
     occupied = np.array([[len(c) > 0 and c[0] > 0 for c in row] for row in _cells], dtype=bool)
@@ -842,10 +849,9 @@ def populate_cells(coverage: float, use_all_tets: bool = False, canvas=None):
 
     if canvas is not None:
         draw_grid()
-
+    return placed_coords
 
 __bounds_cache: dict[tuple[int, int, int, int, int], np.ndarray] = {}
-
 
 def get_cell_bounds(x: int, y: int) -> np.ndarray:
     """
