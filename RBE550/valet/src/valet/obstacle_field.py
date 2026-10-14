@@ -242,16 +242,12 @@ class TF2DOwner:
         using the world transformation matrix.
         """
         pts = np.asarray(points, dtype=np.float64)
-        print(f'pts {pts}')
         if pts.ndim == 1:
             pts = pts.reshape(1, 2)
         ones = np.ones((pts.shape[0], 1), dtype=np.float64)
         h_pts = np.hstack([pts, ones])  # (N, 3)
-        print(f'h_pts {h_pts}')
         m = self.get_world_transform_matrix()  # (3, 3)
-        print(f'm {m}')
         world_h = h_pts @ m.T
-        print(f'world_h {world_h}')
         return world_h[:, :2]
 
 
@@ -516,6 +512,7 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
 
         # Collection of overlay drawables
         self.drawables: list[DrawableRect | DrawableGroup] = []
+        self._in_display = False
 
     def add_drawable(self, drawable: DrawableRect | DrawableGroup):
         """Adds a drawable shape or group to the overlay collection."""
@@ -627,19 +624,37 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
         self.texture_needs_upload = False
 
     def display(self):
-        """Renders the current frame immediately and swaps the buffer."""
+        """Renders the current frame immediately and swaps the buffer to display on screen."""
         if not self.context_created or not self.winfo_ismapped():
             return
         self.tkMakeCurrent()
-        self.redraw()
+        self._in_display = True
+        try:
+            self.redraw()
+        finally:
+            self._in_display = False
         self.tkSwapBuffers()
+
+    def _display(self, evt=None):
+        """Handles display callbacks (e.g. from <Expose> events)."""
+        self.display()
+        if self.animate > 0:
+            self.cb = self.after(self.animate, self._display)
 
     def redraw(self):
         """
         Draws the grid in Pass 1, followed by all transformed overlay shapes in Pass 2.
+        When invoked directly by external callers, delegates to display() to ensure
+        context is current and front/back buffers are swapped.
         """
+        if not getattr(self, '_in_display', False):
+            self.display()
+            return
+
         if self.prog is None:
             return
+
+        GL.glViewport(0, 0, self.width, self.height)
 
         # -------------------------------------------------------------
         # PASS 1: Render background occupancy grid & borders
