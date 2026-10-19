@@ -14,8 +14,9 @@ class Vehicle(obs.DrawableGroup):
     def __init__(self, length, width, x = -1, y = -1, theta = -1):
         global _canvas
         # default starting location is top-left facing down
+        # (clockwise is positive in screenspace because +y is down)
         if theta == -1:
-            theta = 3*np.pi/2
+            theta = np.pi/2
         if x == -1:
             x = abs(np.cos(theta))*np.ceil(length)/2.0 + abs(np.sin(theta))*np.ceil(width)/2.0
         if y == -1:
@@ -38,7 +39,8 @@ if __name__ == '__main__':
     _canvas.add_drawable(car)
 
     def step_time_callback():
-        car.rotate((np.pi/4)/ui.time_rate)
+        car.translate_rel(1.0/ui.time_rate, 0)
+        car.rotate(np.pi/(2*ui.time_rate))
         _canvas.redraw()
 
     ui.step_time_callback = step_time_callback

@@ -2,7 +2,7 @@
 <module external.system.id="pyproject.toml" type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$/valet">
-      <sourceFolder url="file://$MODULE_DIR$/valet/src" />
+      <sourceFolder url="file://$MODULE_DIR$/valet/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/valet/.venv" />
     </content>
     <orderEntry type="jdk" jdkName="~\src\RBE\RBE550\valet\.venv" jdkType="Python SDK" />

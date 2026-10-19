@@ -210,6 +210,12 @@ class TF2DOwner:
         self.x += float(dx)
         self.y += float(dy)
 
+    def translate_rel(self, dx: float, dy: float):
+        rot = self.get_heading_transform_matrix()
+        (dx, dy, _) = (rot @ np.array([dx, dy, 1]).T).T
+        self.x += dx
+        self.y += dy
+
     def rotate(self, dtheta: float):
         """Rotates the transform by dtheta radians."""
         self.theta += float(dtheta)
@@ -235,6 +241,13 @@ class TF2DOwner:
         if self.parent is not None:
             return self.parent.get_world_transform_matrix() @ local
         return local
+
+    def get_heading_transform_matrix(self):
+        """Get only the rotation part of the world transform matrix."""
+        t = self.get_world_transform_matrix()
+        t[0][2] = 0
+        t[1][2] = 0
+        return t
 
     def transform_points(self, points: np.ndarray) -> np.ndarray:
         """
