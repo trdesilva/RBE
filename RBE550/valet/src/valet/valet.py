@@ -18,9 +18,9 @@ class Vehicle(obs.DrawableGroup):
         if theta == -1:
             theta = np.pi/2
         if x == -1:
-            x = abs(np.cos(theta))*np.ceil(length)/2.0 + abs(np.sin(theta))*np.ceil(width)/2.0
+            x = 15 #abs(np.cos(theta))*np.ceil(length)/2.0 + abs(np.sin(theta))*np.ceil(width)/2.0
         if y == -1:
-            y = abs(np.cos(theta))*np.ceil(width)/2.0 + abs(np.sin(theta))*np.ceil(length)/2.0
+            y = 15 #abs(np.cos(theta))*np.ceil(width)/2.0 + abs(np.sin(theta))*np.ceil(length)/2.0
 
         obs.DrawableGroup.__init__(self, x, y, theta, True, _canvas)
         body = obs.DrawableRect(width=length, height=width, fill_color = (0, 1, 0), parent = self)
@@ -31,18 +31,40 @@ class Vehicle(obs.DrawableGroup):
                                           np.linspace(-1, 1, 5), # u_y
                                           np.linspace(-np.pi/2, np.pi/2, 5)]) # u_theta
 
+    def eval_controls(self, u, s, dt = 1., apply = False):
+        result = {'x': u[0] * dt,
+                  'y': u[1] * dt,
+                  'theta': u[2] * dt}
+        if apply:
+            self.x += result['x']
+            self.y += result['y']
+            self.theta += result['theta']
+        return result
+
     def _make_controls(self):
         """
         Create control functions for the vehicle. Control functions take u, an n-tuple representing inputs, and s, a
         3 x m matrix of the vehicle's configuration (x, y, theta) and its (m - 1) differentials. There is one control
         function for each cell in C, and it returns the differential of its respective cell in one timestep given u.
-        This results in a 3 x n x m array of control functions being stored in self.controls.
+        This results in a 3 x n x m array of control functions being stored in self.controls. The base implementation
+        has three inputs, each corresponding to one axis of the vehicle's configuration, and has no differential
+        constraints.
         """
         self.controls = np.array([[lambda u, s: u[0], lambda u, s: 0, lambda u, s: 0],
                                   [lambda u, s: 0, lambda u, s: u[1], lambda u, s: 0],
                                   [lambda u, s: 0, lambda u, s: 0, lambda u, s: u[2]]])
 
     def _generate_motion_primitives(self, u_disc: list[np.ndarray]):
+        """
+        Generate a set of motion primitives for discretizing the path search space and store them in
+        self.motion_primitives. This assumes that self.controls is set correctly (see _make_controls). The base
+        implementation here samples the action space at the minimum, maximum, and minimum-magnitude (i.e. closest to 0)
+        values; calculates all permutations of these sampled actions; and for each permutation, stores the result of
+        applying the permuted action to the vehicle for one time step.
+        :param u_disc: a discretized sample of the action space. Each array in u_disc represents the valid range of
+        values for one component of the action vector that serves as an input to the control functions.
+        :return: None
+        """
         # enumerate lowest, closest to 0, and highest inputs
         assert self.controls.shape[0] == 3, f'controls has incorrect number of rows: {self.controls.shape[0]}'
         assert self.controls.shape[1] == len(u_disc), f'u_disc has incorrect number of controls: {len(u_disc)}'
@@ -55,11 +77,9 @@ class Vehicle(obs.DrawableGroup):
 
         basic_input_perms = _permute_vectors(basic_inputs)
         self.motion_primitives = []
-        for ui in range(basic_input_perms.shape[1]):
-            x = sum(f(basic_input_perms[:, ui], (self.x, self.y, self.theta)) for f in self.controls[0, :])
-            y = sum(f(basic_input_perms[:, ui], (self.x, self.y, self.theta)) for f in self.controls[1, :])
-            theta = sum(f(basic_input_perms[:, ui], (self.x, self.y, self.theta)) for f in self.controls[2, :])
-            self.motion_primitives.append([x, y, theta, 1])
+        for i in range(basic_input_perms.shape[1]):
+            result = self.eval_controls(basic_input_perms[:, i], self)
+            self.motion_primitives.append([result['x'], result['y'], result['theta'], 1])
         print(self.motion_primitives)
 
     def calculate_c_obs(self, obstacles: np.ndarray) -> np.ndarray:
@@ -79,8 +99,8 @@ def _permute_vectors(mat: np.ndarray):
         raise ValueError
 
 if __name__ == '__main__':
-    obs.FIELD_HEIGHT = 12
-    obs.FIELD_WIDTH = 12
+    obs.FIELD_HEIGHT = 30
+    obs.FIELD_WIDTH = 30
     obs._cell_width = 20
     obs._cell_height = 20
     _root_window, _frame, _canvas = ui.create_window()
@@ -88,13 +108,17 @@ if __name__ == '__main__':
     obs.populate_cells(0.2, True, _canvas)
 
     car = Vehicle(meters_to_cells(5.2), meters_to_cells(1.8))
-    car._generate_motion_primitives([])
     _canvas.add_drawable(car)
+    print(f'showing {len(car.motion_primitives)} motion primitives')
 
+    counter = 0
     def step_time_callback():
-        car.translate_rel(1.0/ui.time_rate, 0)
-        car.rotate(np.pi/(2*ui.time_rate))
+        global counter
+        print(counter)
+        motion = car.motion_primitives[counter]
+        car.eval_controls(motion[0:3], car, dt = motion[3], apply = True)
         _canvas.redraw()
+        counter = (counter + 1) % len(car.motion_primitives)
 
     ui.step_time_callback = step_time_callback
 
