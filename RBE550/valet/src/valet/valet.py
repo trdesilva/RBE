@@ -26,6 +26,32 @@ class Vehicle(obs.DrawableGroup):
         body = obs.DrawableRect(width=length, height=width, fill_color = (0, 1, 0), parent = self)
         self.add(body)
 
+    def _make_controls(self):
+        """
+        Create control functions for the vehicle. Control functions take u, an n-tuple representing inputs, and C, a
+        3 x m matrix of the vehicle's state (x, y, theta) and its (m - 1) differentials. There is one control function
+        for each cell in C, and it returns the differential of its respective cell in one timestep given u. This results
+        in a 3 x n x m array of control functions being stored in self.controls.
+        """
+        pass
+
+    def _generate_motion_primitives(self, u_disc: list[np.ndarray]):
+        # enumerate lowest, closest to 0, and highest inputs
+        basic_inputs = np.empty(shape=(len(u_disc), 3))
+        for i in range(len(u_disc)):
+            basic_inputs[i][0] = u_disc[i][0]
+            basic_inputs[i][1] = np.sort(np.abs(u_disc[i]))[0]
+            basic_inputs[i][2] = u_disc[i][len(u_disc[i]) - 1]
+
+        basic_input_perms = np.empty((0))
+        for i in range(len(u_disc)):
+            # TODO: generate all valid input permutations
+
+        pass
+
+    def discretize_c_space(self, obstacles: np.ndarray) -> np.ndarray:
+        pass
+
 if __name__ == '__main__':
     obs.FIELD_HEIGHT = 12
     obs.FIELD_WIDTH = 12
