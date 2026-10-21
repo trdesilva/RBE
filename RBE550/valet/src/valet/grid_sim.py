@@ -4,7 +4,8 @@ from tkinter import ttk
 import obstacle_field as obs
 import time
 
-time_rate = 10
+time_rate = 1
+fps = 30
 _current_time_rate = 0
 step_time_callback = None
 
@@ -26,7 +27,7 @@ def create_window():
         if step_time_callback is not None:
             step_time_callback()
         if _current_time_rate > 0:
-            root_window.after(int(1000 / _current_time_rate - (time.perf_counter_ns() - loop_start) / 1000000), step_time)
+            root_window.after(int(1000 / fps - (time.perf_counter_ns() - loop_start) / 1000000), step_time)
 
     def start_time():
         global _current_time_rate

@@ -212,7 +212,7 @@ class TF2DOwner:
 
     def translate_rel(self, dx: float, dy: float):
         rot = self.get_heading_transform_matrix()
-        (dx, dy, _) = (rot @ np.array([dx, dy, 1]).T).T
+        (dx, dy) = (rot @ np.array([dx, dy]).T).T
         self.x += dx
         self.y += dy
 
@@ -245,9 +245,7 @@ class TF2DOwner:
     def get_heading_transform_matrix(self):
         """Get only the rotation part of the world transform matrix."""
         t = self.get_world_transform_matrix()
-        t[0][2] = 0
-        t[1][2] = 0
-        return t
+        return t[0:2, 0:2]
 
     def transform_points(self, points: np.ndarray) -> np.ndarray:
         """
