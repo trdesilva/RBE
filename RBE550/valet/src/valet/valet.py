@@ -2,6 +2,7 @@ import obstacle_field as obs
 import numpy as np
 import grid_sim as ui
 from dataclasses import dataclass
+import fastquadtree as qt
 
 METERS_PER_CELL = 3.0
 
@@ -46,8 +47,8 @@ class Vehicle(obs.DrawableGroup):
             y = 15 #abs(np.cos(theta))*np.ceil(width)/2.0 + abs(np.sin(theta))*np.ceil(length)/2.0
 
         obs.DrawableGroup.__init__(self, x, y, theta, True, _canvas)
-        body = obs.DrawableRect(width=length, height=width, fill_color = (0, 1, 0), parent = self)
-        self.add(body)
+        self.body = obs.DrawableRect(width=length, height=width, fill_color = (0, 1, 0), parent = self)
+        self.add(self.body)
 
         self.state_shape = state_shape
         self.controls = controls
@@ -145,6 +146,38 @@ class Vehicle(obs.DrawableGroup):
     def _calculate_c_obs(self, obstacles: np.ndarray) -> np.ndarray:
         pass
 
+    def check_collision(self, obs_quadtree: qt.RectQuadTree):
+        body_verts = self.body.get_world_vertices()
+        body_aabb = self.body.get_aabb()
+        nearest_cells = obs_quadtree.query(body_aabb)
+        for cell in nearest_cells:
+            # query returns (id, minx, miny, maxx, maxy)
+            # check if corners of the cell are in the body or vice versa
+            minx = cell[1]
+            miny = cell[2]
+            maxx = cell[3]
+            maxy = cell[4]
+            cell_verts_inside = np.zeros((4,4), dtype=bool)
+
+            for i in range(4):
+                bv = body_verts[:, i]
+                if minx <= bv[0] <= maxx and miny <= bv[1] <= maxy:
+                    # body corner inside cell
+                    return True
+                bv_next = body_verts[:, (i + 1) % 4]
+                # check all cell vertices for being to the left of edge (bv, bv_next)
+                for j in range(4):
+                    cell_vert = np.array([cell[2*np.floor(j/2) + 1], cell[2*(j % 2) + 2]]).T
+                    cell_verts_inside[i, j] = np.linalg.det(np.vstack((np.hstack((bv, bv_next, cell_vert)),
+                                                                      np.ones((1, 3))))) <= 0
+
+            # if any cell vertex is inside (left of) all body edges
+            if np.any(np.all(cell_verts_inside, axis=0)):
+                return True
+
+        return False
+
+
 class Robot(Vehicle):
     def __init__(self):
         Vehicle.__init__(self, length=meters_to_cells(.7), width=meters_to_cells(.57), controls=2)
@@ -224,6 +257,10 @@ if __name__ == '__main__':
             robot.queue_motion(motion)
             counter = (counter + 1) % len(robot.motion_primitives)
         robot.run_queued_motions(ui.time_rate/ui.fps)
+        if robot.check_collision(obs.obs_quadtree):
+            robot.body.fill_color = (1.0, 0, 0)
+            ui._current_time_rate = 0
+            print(f'robot crashed')
         _canvas.redraw()
 
     ui.step_time_callback = step_time_callback

@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import ttk
 import obstacle_field as obs
 import time
+import fastquadtree as qt
 
 time_rate = 1
 fps = 30
@@ -17,6 +18,8 @@ def create_window():
     frame = ttk.Frame(root_window, padding=10)
     frame.grid()
     canvas_size = obs.get_cell_bounds(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1)[1]
+    obs.obs_quadtree = qt.RectQuadTree((0, 0, obs.FIELD_WIDTH, obs.FIELD_HEIGHT),
+                                       capacity=int(0.7 * obs.FIELD_WIDTH * obs.FIELD_HEIGHT))
     widget = obs.ObstacleFieldWidget(frame, width=canvas_size[0], height=canvas_size[1])
     widget.grid(columnspan=4)
     obs._active_widget = widget

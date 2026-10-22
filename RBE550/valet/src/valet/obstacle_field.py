@@ -19,6 +19,7 @@ import parse
 from OpenGL import GL
 from OpenGL.GL import shaders
 from pyopengltk import OpenGLFrame
+import fastquadtree as qt
 
 # Default occupancy grid dimensions
 FIELD_WIDTH = 128
@@ -29,6 +30,8 @@ _cells: list[list[list[Any]]] = [[[] for _ in range(FIELD_WIDTH)] for _ in range
 _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
 _bg_rects: list[Any] = []
 _fill_func = lambda value: 'black' if value is not None and len(value) > 0 and value[0] > 0 else 'white'
+
+obs_quadtree = None
 
 _cell_width = 6
 _cell_height = 6
@@ -177,6 +180,7 @@ class TF2DOwner:
     """
     Base class representing an entity with a 2D rigid transform (translation x, y
     and heading theta in radians). Supports hierarchical parent-child transforms.
+    All point and vector transformation APIs operate exclusively using column vectors.
     """
     def __init__(self,
                  x: float = 0.0,
@@ -211,10 +215,11 @@ class TF2DOwner:
         self.y += float(dy)
 
     def translate_rel(self, dx: float, dy: float):
+        """Translates relative to current heading using column vector rotation."""
         rot = self.get_heading_transform_matrix()
-        (dx, dy) = (rot @ np.array([dx, dy]).T).T
-        self.x += dx
-        self.y += dy
+        d_pos = rot @ np.array([[dx], [dy]], dtype=np.float64)
+        self.x += float(d_pos[0, 0])
+        self.y += float(d_pos[1, 0])
 
     def rotate(self, dtheta: float):
         """Rotates the transform by dtheta radians."""
@@ -249,22 +254,38 @@ class TF2DOwner:
 
     def transform_points(self, points: np.ndarray) -> np.ndarray:
         """
-        Transforms an (N, 2) array of local points into world coordinates
-        using the world transformation matrix.
+        Transforms local points into world coordinates using the world
+        transformation matrix and column-vector convention (m @ h_pts).
+
+        :param points: Local points as column vectors of shape (2, N) or a single
+                       vector of shape (2,).
+        :return: Transformed points as column vectors of shape (2, N) or (2,).
         """
         pts = np.asarray(points, dtype=np.float64)
-        if pts.ndim == 1:
-            pts = pts.reshape(1, 2)
-        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
-        h_pts = np.hstack([pts, ones])  # (N, 3)
+        is_1d = pts.ndim == 1
+        if is_1d:
+            if pts.shape[0] != 2:
+                raise ValueError(f"Expected 2-element vector, got shape {pts.shape}")
+            pts = pts.reshape(2, 1)
+        elif pts.ndim == 2:
+            if pts.shape[0] != 2:
+                raise ValueError(f"Expected column vectors with shape (2, N), got {pts.shape}")
+        else:
+            raise ValueError(f"Expected 1D or 2D array, got {pts.ndim}D array")
+
+        ones = np.ones((1, pts.shape[1]), dtype=np.float64)
+        h_pts = np.vstack([pts, ones])  # (3, N)
         m = self.get_world_transform_matrix()  # (3, 3)
-        world_h = h_pts @ m.T
-        return world_h[:, :2]
+        world_h = m @ h_pts  # (3, N)
+        result = world_h[:2, :]
+
+        return result.ravel() if is_1d else result
 
 
 class DrawableRect(TF2DOwner):
     """
     A transformable 2D rectangle drawable on the grid or in screen pixels.
+    All vertex APIs return column vectors of shape (2, N).
     """
     def __init__(
         self,
@@ -293,8 +314,9 @@ class DrawableRect(TF2DOwner):
 
     def get_local_vertices(self) -> np.ndarray:
         """
-        Returns the 4 local vertices of the rectangle relative to its pose origin:
-        [top-left, top-right, bottom-right, bottom-left].
+        Returns the 4 local vertices of the rectangle relative to its pose origin
+        as column vectors of shape (2, 4):
+        columns: [top-left, top-right, bottom-right, bottom-left].
         """
         ox, oy = self.origin
         x0 = -ox * self.width
@@ -302,15 +324,32 @@ class DrawableRect(TF2DOwner):
         y0 = -oy * self.height
         y1 = (1.0 - oy) * self.height
         return np.array([
-            [x0, y0],
-            [x1, y0],
-            [x1, y1],
-            [x0, y1],
+            [x0, x1, x1, x0],
+            [y0, y0, y1, y1],
         ], dtype=np.float64)
 
     def get_world_vertices(self) -> np.ndarray:
-        """Transforms local vertices into world (grid or root parent) coordinates."""
+        """
+        Transforms local vertices into world (grid or root parent) coordinates
+        as column vectors of shape (2, 4).
+        """
         return self.transform_points(self.get_local_vertices())
+
+    def get_aabb(self, qt_format = True):
+        """
+        Get coordinates of axis-aligned bounding box.
+        :param qt_format: whether to use fastquadtree's convention of (minx, miny, maxx, maxy) or a matrix with two
+        column vectors for the return value
+        :return: coordinates of the bounding box's corners, ordered according to qt_format
+        """
+        world_verts = self.get_world_vertices()
+        # world_verts has shape (2, 4): row 0 is x, row 1 is y
+        minx = np.min(world_verts[0, :])
+        miny = np.min(world_verts[1, :])
+        maxx = np.max(world_verts[0, :])
+        maxy = np.max(world_verts[1, :])
+        # fastquadtree convention (minx, miny, maxx, maxy), else two column vectors
+        return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 
 
 class DrawableGroup(TF2DOwner):
@@ -493,6 +532,7 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
     OpenGL-accelerated Tkinter widget replacing the Tkinter Canvas.
     Draws the grid of cells and borders in parallel on the GPU, and renders
     collections of transformed shapes (DrawableRect, DrawableGroup) over the grid.
+    Public coordinate conversion APIs work in column vectors of shape (2, N).
     """
     def __init__(self, master=None, **kw):
         super().__init__()
@@ -541,30 +581,54 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
 
     def grid_to_pixel(self, points: np.ndarray) -> np.ndarray:
         """
-        Converts (N, 2) grid coordinates to window screen pixels:
+        Converts (2, N) grid coordinates (column vectors) to window screen pixels (2, N):
         px = 2 * cell_border + gx * (cell_width + cell_border)
         py = 2 * cell_border + gy * (cell_height + cell_border)
         """
         pts = np.asarray(points, dtype=np.float64)
+        is_1d = pts.ndim == 1
+        if is_1d:
+            if pts.shape[0] != 2:
+                raise ValueError(f"Expected 2-element vector, got shape {pts.shape}")
+            pts = pts.reshape(2, 1)
+        elif pts.ndim == 2:
+            if pts.shape[0] != 2:
+                raise ValueError(f"Expected column vectors with shape (2, N), got {pts.shape}")
+        else:
+            raise ValueError(f"Expected 1D or 2D array, got {pts.ndim}D array")
+
         margin = 2.0 * self.cell_border
         stride_x = self.cell_size[0] + self.cell_border
         stride_y = self.cell_size[1] + self.cell_border
-        px = margin + pts[:, 0] * stride_x
-        py = margin + pts[:, 1] * stride_y
-        return np.column_stack([px, py])
+        px = margin + pts[0, :] * stride_x
+        py = margin + pts[1, :] * stride_y
+        res = np.vstack([px, py])
+        return res.ravel() if is_1d else res
 
     def pixel_to_ndc(self, pixels: np.ndarray) -> np.ndarray:
         """
-        Converts (N, 2) window screen pixel coordinates to OpenGL NDC [-1, 1]:
+        Converts (2, N) window screen pixel coordinates (column vectors) to OpenGL NDC [-1, 1] (2, N):
         X_ndc = (2 * px / viewport_width) - 1.0
         Y_ndc = 1.0 - (2 * py / viewport_height)
         """
         pts = np.asarray(pixels, dtype=np.float64)
+        is_1d = pts.ndim == 1
+        if is_1d:
+            if pts.shape[0] != 2:
+                raise ValueError(f"Expected 2-element vector, got shape {pts.shape}")
+            pts = pts.reshape(2, 1)
+        elif pts.ndim == 2:
+            if pts.shape[0] != 2:
+                raise ValueError(f"Expected column vectors with shape (2, N), got {pts.shape}")
+        else:
+            raise ValueError(f"Expected 1D or 2D array, got {pts.ndim}D array")
+
         vw = max(float(self.width), 1.0)
         vh = max(float(self.height), 1.0)
-        ndc_x = (2.0 * pts[:, 0] / vw) - 1.0
-        ndc_y = 1.0 - (2.0 * pts[:, 1] / vh)
-        return np.column_stack([ndc_x, ndc_y])
+        ndc_x = (2.0 * pts[0, :] / vw) - 1.0
+        ndc_y = 1.0 - (2.0 * pts[1, :] / vh)
+        res = np.vstack([ndc_x, ndc_y])
+        return res.ravel() if is_1d else res
 
     def initgl(self):
         """Initializes OpenGL viewport, shaders, VBOs, and textures."""
@@ -718,19 +782,22 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                 GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.shape_vbo)
 
                 for rect in rects:
-                    world_pts = rect.get_world_vertices()  # (4, 2)
+                    world_pts = rect.get_world_vertices()  # (2, 4) column vectors
                     if rect.coordinate_frame == "grid":
-                        pixel_pts = self.grid_to_pixel(world_pts)
+                        pixel_pts = self.grid_to_pixel(world_pts)  # (2, 4) column vectors
                     else:
                         pixel_pts = world_pts
-                    ndc_pts = self.pixel_to_ndc(pixel_pts)  # (4, 2)
+                    ndc_pts = self.pixel_to_ndc(pixel_pts)  # (2, 4) column vectors
+
+                    # Implementation detail: OpenGL buffer expects row vectors (4, 2)
+                    ndc_pts_row = ndc_pts.T
 
                     # Filled quad (2 triangles: 0-1-2 and 0-2-3)
                     fill_rgba = parse_color_rgba(rect.fill_color)
                     if fill_rgba[3] > 0.0:
                         tri_verts = np.array([
-                            ndc_pts[0], ndc_pts[1], ndc_pts[2],
-                            ndc_pts[0], ndc_pts[2], ndc_pts[3],
+                            ndc_pts_row[0], ndc_pts_row[1], ndc_pts_row[2],
+                            ndc_pts_row[0], ndc_pts_row[2], ndc_pts_row[3],
                         ], dtype=np.float32)
                         GL.glUniform4f(loc_col, *fill_rgba)
                         GL.glBufferData(GL.GL_ARRAY_BUFFER, tri_verts.nbytes, tri_verts, GL.GL_DYNAMIC_DRAW)
@@ -741,7 +808,7 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                     if rect.border_color is not None and rect.border_width > 0.0:
                         border_rgba = parse_color_rgba(rect.border_color)
                         if border_rgba[3] > 0.0:
-                            line_verts = np.asarray(ndc_pts, dtype=np.float32)
+                            line_verts = np.ascontiguousarray(ndc_pts_row, dtype=np.float32)
                             GL.glLineWidth(max(1.0, float(rect.border_width)))
                             GL.glUniform4f(loc_col, *border_rgba)
                             GL.glBufferData(GL.GL_ARRAY_BUFFER, line_verts.nbytes, line_verts, GL.GL_DYNAMIC_DRAW)
@@ -840,7 +907,7 @@ def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
     :param canvas: the canvas/widget to draw on
     :return: A dictionary mapping (x, y) coordinate pairs to tetromino cell arrays placed there
     """
-    global _cells, _rects, _grid_colors
+    global _cells, _rects, _grid_colors, obs_quadtree
     _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
     _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
 
@@ -865,6 +932,7 @@ def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
                     cell[0] = tet_cells[i]
                 else:
                     cell.append(tet_cells[i])
+                    obs_quadtree.insert((cx, cy, cx + 1, cy + 1))
 
         placed_coords[(x, y)] = tet_cells
 
@@ -1055,11 +1123,12 @@ def create_window():
     """
     Creates the Tkinter root, a ttk.Frame, and the GPU-accelerated ObstacleFieldWidget.
     """
-    global _active_widget
+    global _active_widget, obs_quadtree
     root_window = tk.Tk()
     frame = ttk.Frame(root_window, padding=10)
     frame.grid()
     canvas_size = get_cell_bounds(FIELD_WIDTH - 1, FIELD_HEIGHT - 1)[1]
+    obs_quadtree = qt.RectQuadTree((0, 0, FIELD_WIDTH, FIELD_HEIGHT), capacity=int(0.7 * FIELD_WIDTH * FIELD_HEIGHT))
     widget = ObstacleFieldWidget(frame, width=canvas_size[0], height=canvas_size[1])
     widget.grid(columnspan=4)
     _active_widget = widget
