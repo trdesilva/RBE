@@ -91,12 +91,14 @@ class Vehicle(obs.DrawableGroup):
         """
         # enumerate lowest, closest to 0, and highest inputs
         assert self.controls == len(u_disc), f'u_disc has incorrect number of controls: {len(u_disc)}'
-        basic_inputs = np.empty(shape=(len(u_disc), 3))
+        basic_inputs = []
         for i in range(len(u_disc)):
             u_disc[i].sort()
-            basic_inputs[i][0] = u_disc[i][0]
-            basic_inputs[i][1] = np.sort(np.abs(u_disc[i]))[0]
-            basic_inputs[i][2] = u_disc[i][len(u_disc[i]) - 1]
+            basic_inputs.append(np.array([
+                u_disc[i][0],
+                np.sort(np.abs(u_disc[i]))[0],
+                u_disc[i][len(u_disc[i]) - 1]
+            ]))
 
         basic_input_perms = _permute_vectors(basic_inputs)
         self.motion_primitives = []
@@ -165,24 +167,39 @@ class Robot(Vehicle):
 
     def generate_special_motion_primitives(self):
         u_disc = self._get_default_u_disc()
-
+        input_perms = _permute_vectors([u_disc[0], np.array([u_disc[1][1], u_disc[1][2]])])
+        for i in range(input_perms.shape[1]):
+            result = self.eval_controls(input_perms[:, i], VehicleState(0, 0, 0))
+            mp = MotionPrimitive([InputFrame(input_perms[:, i], 1)],
+                                 [StateFrame(result, 1)])
+            self.motion_primitives.append(mp)
 
     def _get_default_u_disc(self):
         return [np.array([-1, 0, 1]),
                 np.linspace(-np.pi/2, np.pi/2, 5)]
 
-def _permute_vectors(mat: np.ndarray):
-    if len(mat.shape) == 1 or (len(mat.shape) == 2 and mat.shape[0] == 1):
-        return mat
-    elif len(mat.shape) == 2:
-        next = _permute_vectors(mat[1:])
-        result = np.empty((mat.shape[0], 0))
-        for i in range(mat.shape[1]):
-            result = np.hstack((result,
-                                np.concat((np.ones((1, next.shape[1])) * mat[0][i], next))))
-        return result
-    else:
-        raise ValueError
+def _permute_vectors(vecs: list[np.ndarray]) -> np.ndarray:
+    """
+    Permute arbitrary sets of vector components.
+    :param vecs: A list of 1D numpy arrays, where the nth array contains all
+                 possible values for the nth component of a result vector.
+    :return: A 2D numpy array of shape (len(vecs), N) where each column is a
+             permuted vector of cardinality len(vecs).
+    """
+    if isinstance(vecs, np.ndarray):
+        if vecs.ndim == 1:
+            vecs = [vecs]
+        elif vecs.ndim == 2:
+            vecs = [row for row in vecs]
+        else:
+            raise ValueError(f"Expected 1D or 2D array, got {vecs.ndim}D array")
+    if len(vecs) == 0:
+        return np.empty((0, 0))
+    if any(len(v) == 0 for v in vecs):
+        return np.empty((len(vecs), 0))
+    vecs = [np.asarray(v).ravel() for v in vecs]
+    grids = np.meshgrid(*vecs, indexing='ij')
+    return np.stack(grids, axis=0).reshape(len(vecs), -1)
 
 if __name__ == '__main__':
     obs.FIELD_HEIGHT = 30
