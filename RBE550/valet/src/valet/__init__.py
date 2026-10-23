@@ -8,6 +8,17 @@ from valet.obstacle_field import (
     draw_grid,
     populate_cells,
 )
+from valet import planner
+from valet.planner import (
+    InputFrame,
+    MotionPrimitive,
+    Robot,
+    StateFrame,
+    Vehicle,
+    VehicleState,
+    cells_to_meters,
+    meters_to_cells,
+)
 
 __all__ = [
     "obstacle_field",
@@ -19,6 +30,15 @@ __all__ = [
     "draw_grid",
     "populate_cells",
     "main",
+    "planner",
+    "InputFrame",
+    "MotionPrimitive",
+    "Robot",
+    "StateFrame",
+    "Vehicle",
+    "VehicleState",
+    "cells_to_meters",
+    "meters_to_cells",
 ]
 
 

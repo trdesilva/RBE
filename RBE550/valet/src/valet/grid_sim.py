@@ -1,9 +1,16 @@
 import functools
 import tkinter as tk
 from tkinter import ttk
-import obstacle_field as obs
 import time
 import fastquadtree as qt
+
+try:
+    from valet import obstacle_field as obs
+except ImportError:
+    try:
+        from . import obstacle_field as obs
+    except ImportError:
+        import obstacle_field as obs
 
 time_rate = 1
 fps = 30

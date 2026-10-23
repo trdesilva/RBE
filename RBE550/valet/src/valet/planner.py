@@ -1,8 +1,19 @@
-import obstacle_field as obs
-import numpy as np
-import grid_sim as ui
 from dataclasses import dataclass
+import numpy as np
 import fastquadtree as qt
+
+try:
+    from valet import obstacle_field as obs
+    from valet import grid_sim as ui
+except ImportError:
+    try:
+        from . import obstacle_field as obs
+        from . import grid_sim as ui
+    except ImportError:
+        import obstacle_field as obs
+        import grid_sim as ui
+
+_canvas = None
 
 METERS_PER_CELL = 3.0
 
@@ -35,8 +46,9 @@ class MotionPrimitive:
     dt: float= 1
 
 class Vehicle(obs.DrawableGroup):
-    def __init__(self, length, width, x = -1, y = -1, theta = -1, controls = 3, state_shape = (3, 1)):
+    def __init__(self, length, width, x = -1, y = -1, theta = -1, controls = 3, state_shape = (3, 1), canvas = None):
         global _canvas
+        parent_canvas = canvas if canvas is not None else _canvas
         # default starting location is top-left facing down
         # (clockwise is positive in screenspace because +y is down)
         if theta == -1:
@@ -46,7 +58,7 @@ class Vehicle(obs.DrawableGroup):
         if y == -1:
             y = 15 #abs(np.cos(theta))*np.ceil(width)/2.0 + abs(np.sin(theta))*np.ceil(length)/2.0
 
-        obs.DrawableGroup.__init__(self, x, y, theta, True, _canvas)
+        obs.DrawableGroup.__init__(self, x, y, theta, True, parent_canvas)
         self.body = obs.DrawableRect(width=length, height=width, fill_color = (0, 1, 0), parent = self)
         self.add(self.body)
 
@@ -167,8 +179,8 @@ class Vehicle(obs.DrawableGroup):
                 bv_next = body_verts[:, (i + 1) % 4]
                 # check all cell vertices for being to the left of edge (bv, bv_next)
                 for j in range(4):
-                    cell_vert = np.array([cell[2*np.floor(j/2) + 1], cell[2*(j % 2) + 2]]).T
-                    cell_verts_inside[i, j] = np.linalg.det(np.vstack((np.hstack((bv, bv_next, cell_vert)),
+                    cell_vert = np.array([cell[2*int(j/2) + 1], cell[2*(j % 2) + 2]]).T
+                    cell_verts_inside[i, j] = np.linalg.det(np.vstack((np.column_stack((bv, bv_next, cell_vert)),
                                                                       np.ones((1, 3))))) <= 0
 
             # if any cell vertex is inside (left of) all body edges
@@ -179,8 +191,8 @@ class Vehicle(obs.DrawableGroup):
 
 
 class Robot(Vehicle):
-    def __init__(self):
-        Vehicle.__init__(self, length=meters_to_cells(.7), width=meters_to_cells(.57), controls=2)
+    def __init__(self, canvas = None):
+        Vehicle.__init__(self, length=meters_to_cells(.7), width=meters_to_cells(.57), controls=2, canvas=canvas)
         self.children[0].fill_color = (0, 0.8, 0)
         self.children[0].border_color = (0, 0, 0, 0.5)
 

@@ -4,7 +4,7 @@ A GPU-accelerated robotics grid environment for RBE550, featuring an OpenGL-base
 
 ## Overview
 
-The `obstacle_field` module in `valet` provides hardware-accelerated grid rendering for occupancy grids, obstacle simulations, and 2D transformed shape overlays. It replaces standard CPU-bound Tkinter Canvas drawing—which suffered from severe performance bottlenecks when rendering tens of thousands of individual rectangles and border lines—with OpenGL fragment shaders powered by `pyopengltk` and `PyOpenGL`.
+The `obstacle_field` module in `planner.py` provides hardware-accelerated grid rendering for occupancy grids, obstacle simulations, and 2D transformed shape overlays. It replaces standard CPU-bound Tkinter Canvas drawing—which suffered from severe performance bottlenecks when rendering tens of thousands of individual rectangles and border lines—with OpenGL fragment shaders powered by `pyopengltk` and `PyOpenGL`.
 
 ### Performance Highlights
 - **Hardware-Accelerated Rendering**: Cell states and occupancy grids are transferred to GPU textures and rendered using a fragment shader in a single draw call.
