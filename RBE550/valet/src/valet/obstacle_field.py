@@ -1125,7 +1125,8 @@ def clear_cell(x: int, y: int):
     _cells[y][x].clear()
     obstacles = obs_quadtree.query((x, y, x + 1, y + 1))
     for o in obstacles:
-        obs_quadtree.delete_tuple(o)
+        if int(o[1]) == x and int(o[2]) == y:
+            obs_quadtree.delete_tuple(o)
     if _grid_colors is not None and 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
         _grid_colors[y, x] = convert_text_to_rgb(_fill_func(_cells[y][x]))
 

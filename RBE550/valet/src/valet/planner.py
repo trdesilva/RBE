@@ -1,10 +1,10 @@
 import math
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Iterable
 
 from astar import AStar, T, SearchNode
 import numpy as np
+import scipy as sc
 import fastquadtree as qt
 
 try:
@@ -50,38 +50,35 @@ class MotionPrimitive: # motion primitive states should be applied in vehicle co
     states: list[StateFrame] # states are relative to t=0, i.e. before motion was applied
     dt: float= 1
 
-class MPSearchNode:
+class MPSearchNode(obs.TF2DOwner):
     def __init__(self, via: MotionPrimitive | None, x: float, y: float, theta: float, dt: float, body: obs.DrawableRect):
+        obs.TF2DOwner.__init__(self, x, y, theta)
         self.via = via
-        self.x = x
-        self.y = y
-        self.theta = theta
         self.dt = dt
-        self.body = body.copy()
-        self.body.set_pose(x, y, theta)
+        self._body = body.copy()
+        self._body.set_pose(x, y, theta)
+        self._body.parent = None
 
     def reverse_via(self):
         """
         Apply the reverse of via to self.body.
         """
-        last_frame = self.via.states[-1]
-        # TODO this doesn't account for MPs being relative to vehicle
-        return (self.x - last_frame.state.x, self.y - last_frame.state.y,
-                self.theta - last_frame.state.theta)
+        if self.via is not None:
+            last_frame = self.via.states[-1]
+            self._body.theta = self.theta - last_frame.state.theta
+            new_pose = self._body.get_world_transform_matrix() @ np.array((-last_frame.state.x, -last_frame.state.y, 1))
+            self._body.set_pose(new_pose[0], new_pose[1])
 
-    def check_collision(self, obs_quadtree, samples = 10):
+    def check_collision(self, obs_quadtree):
         if self.via is None:
-            return check_collision(self.body, obs_quadtree)
+            return check_collision(self._body, obs_quadtree)
         if 0 <= self.x <= obs.FIELD_WIDTH and 0 <= self.y <= obs.FIELD_HEIGHT:
-            start_x, start_y, start_theta = self.reverse_via()
-            self.body.x = start_x
-            self.body.y = start_y
-            self.body.theta = start_theta
-            time = (1. / (samples - 1)) * self.via.dt
-            for i in range(samples):
-                self.body.translate_rel(time * (self.x - start_x), time * (self.y - start_y))
-                self.body.theta += (time * (self.theta - start_theta))
-                if check_collision(self.body, obs_quadtree):
+            self.reverse_via()
+            start_tf = self._body.get_world_transform_matrix()
+            for frame in self.via.states:
+                new_pose = start_tf @ np.array((frame.state.x, frame.state.y, 1))
+                self._body.set_pose(new_pose[0], new_pose[1], self._body.theta + frame.state.theta)
+                if check_collision(self._body, obs_quadtree):
                     return True
             return False
         else:
@@ -97,7 +94,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         # default starting location is top-left facing down
         # (clockwise is positive in screenspace because +y is down)
         if theta == -1:
-            theta = np.pi/2
+            theta = 0 #-np.pi/2
         if x == -1:
             x = abs(np.cos(theta))*np.ceil(length)/2.0 + abs(np.sin(theta))*np.ceil(width)/2.0
         if y == -1:
@@ -110,12 +107,23 @@ class Vehicle(obs.DrawableGroup, AStar):
         self.state_shape = state_shape
         self.controls = controls
         self._generate_default_motion_primitives(self._get_default_u_disc())
-        # TODO need to make a plan by calling self.astar() somewhere
+
         self.mp_queue = [] # MotionPrimitives to execute
         self.mp_frame = 0 # which frame in mp_queue[0] is active
         self.mp_time = 0 # how long mp_frame has been active
+        self.mp_tf = self.get_world_transform_matrix()
 
-    def eval_controls(self, u, s, dt = 1., apply = False):
+    def _make_controls(self, u, s0):
+        """
+        :param u: The control input vector to apply to the vehicle. The base implementation expects 3 inputs.
+        :param s0: The initial state of the vehicle when the control input is applied
+        :return: A function that can be passed to scipy.integrate.RK45 to estimate the vehicle's state given control
+        input u. Takes time as t and a state vector as s, and returns a state vector with the same shape as s. The base
+        implementation adds the inputs to the vehicle's configuration at each timestep.
+        """
+        return lambda t, s: np.array([u[0], u[1], u[2]])
+
+    def eval_controls(self, u, s, dt = 1., samples = 10, apply = False):
         """
         Evaluate the control function for the vehicle. The base implementation has three inputs, each corresponding to
         one axis of the vehicle's configuration, and has no differential constraints.
@@ -123,17 +131,21 @@ class Vehicle(obs.DrawableGroup, AStar):
         :param s: 3 x m matrix of the vehicle's configuration (x, y, theta) and its (m - 1) differentials (shape should
         match self.state_shape)
         :param dt: the length of the timestep to apply u for (default 1)
+        :param samples: the number of samples to take
         :param apply: whether to apply the result to the vehicle's state (default False)
-        :return: a dictionary containing the changes to the vehicle's state that applying the action u would cause. Keys
-        are field names in the Vehicle class (x, y, theta) or its child classes.
+        :return: a list of StateFrames describing the vehicle's state at each sample
         """
-        result = VehicleState(u[0] * dt,
-                              u[1] * dt,
-                              u[2] * dt)
+        result = []
+        integrator = sc.integrate.RK45(fun=self._make_controls(u, s), t0=0, y0=s, t_bound=dt,
+                                       max_step=dt/samples, first_step=dt/samples)
+        for i in range(samples):
+            integrator.step()
+            result.append(StateFrame(VehicleState(integrator.y[0], integrator.y[1], integrator.y[2]), integrator.t))
+
         if apply:
-            self.x += result.x
-            self.y += result.y
-            self.theta += result.theta
+            self.x += result[-1].state.x
+            self.y += result[-1].state.y
+            self.theta += result[-1].state.theta
         return result
 
     def _generate_default_motion_primitives(self, u_disc: list[np.ndarray]):
@@ -161,10 +173,9 @@ class Vehicle(obs.DrawableGroup, AStar):
         basic_input_perms = _permute_vectors(basic_inputs)
         self.motion_primitives = []
         for i in range(basic_input_perms.shape[1]):
-            # TODO this doesn't work with nonholonomic constraints
-            result = self.eval_controls(basic_input_perms[:, i], VehicleState(0, 0, 0))
+            result = self.eval_controls(basic_input_perms[:, i], np.zeros(3))
             mp = MotionPrimitive([InputFrame(basic_input_perms[:, i], 1)],
-                                 [StateFrame(result, 1)])
+                                 result)
             self.motion_primitives.append(mp)
         print(self.motion_primitives)
 
@@ -177,22 +188,38 @@ class Vehicle(obs.DrawableGroup, AStar):
 
         # if time advances less than a frame, interpolate
         frame = self.mp_queue[0].states[self.mp_frame]
+        last_frame = self.mp_queue[0].states[self.mp_frame - 1] if self.mp_frame > 0 \
+            else StateFrame(VehicleState(0,0,0), 0)
         if self.mp_time + dt < frame.dt:
             self.mp_time += dt
-            self.translate_rel(frame.state.x * dt / frame.dt, frame.state.y * dt / frame.dt)
+            # MotionPrimitives record states in the initial coordinate frame, so transform based on where the motion
+            # started rather than the current position
+            diff = self.mp_tf @ np.array(
+                [last_frame.state.x + (self.mp_time - last_frame.dt)*(frame.state.x - last_frame.state.x)
+                                       /(frame.dt - last_frame.dt),
+                 last_frame.state.y + (self.mp_time - last_frame.dt)*(frame.state.y - last_frame.state.y)
+                                       /(frame.dt - last_frame.dt),
+                 1])
+            self.set_pose(diff[0], diff[1])
             self.rotate(frame.state.theta * dt / frame.dt)
             return
 
         # time advances at least one frame, so skip to the next one
         time_skipped = frame.dt - self.mp_time
-        self.mp_time = 0
-        self.translate_rel(frame.state.x * time_skipped / frame.dt, frame.state.y * time_skipped / frame.dt)
+        self.mp_time = frame.dt
+        diff = self.mp_tf @ np.array([frame.state.x,
+                                      frame.state.y,
+                                      1])
+        self.set_pose(diff[0], diff[1])
         self.rotate(frame.state.theta * time_skipped / frame.dt)
 
         self.mp_frame += 1
         if self.mp_frame >= len(self.mp_queue[0].states):
             self.mp_frame = 0
+            self.mp_time = 0
+            print(f'Finished {self.mp_queue[0]} at {self.x, self.y, self.theta}')
             self.mp_queue.pop(0)
+            self.mp_tf = self.get_world_transform_matrix()
         self.run_queued_motions(dt - time_skipped)
 
     def check_collision(self, obs_quadtree: qt.RectQuadTree):
@@ -214,8 +241,8 @@ class Vehicle(obs.DrawableGroup, AStar):
         result = []
         for mp in self.motion_primitives:
             mp_dest = mp.states[-1].state
-            (tx, ty) = node.body.get_heading_transform_matrix() @ np.array((mp_dest.x, mp_dest.y))
-            mp_node = MPSearchNode(mp, node.x + tx, node.y + ty, node.theta + mp_dest.theta, mp.dt, node.body)
+            mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
+            mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
             if not mp_node.check_collision(obs.obs_quadtree):
                 result.append(mp_node)
         return result
@@ -241,25 +268,16 @@ class Robot(Vehicle):
 
         self.generate_special_motion_primitives()
 
-    def eval_controls(self, u, s, dt = 1, apply = False):
-        result = VehicleState(u[0] * np.cos(s.theta) * dt,
-                              u[0] * np.sin(s.theta) * dt,
-                              u[1] * dt)
-        if apply and s == self:
-            self.x += result.x
-            self.y += result.y
-            self.theta += result.theta
-        elif apply:
-            print(f'eval_controls can\'t apply input to non-self state {s}')
-        return result
+    def _make_controls(self, u, s0):
+        return lambda t, s: np.array([u[0]*np.cos(s[2]), u[0]*np.sin(s[2]), u[1]])
 
     def generate_special_motion_primitives(self):
         u_disc = self._get_default_u_disc()
         input_perms = _permute_vectors([u_disc[0], np.array([u_disc[1][1], u_disc[1][2]])])
         for i in range(input_perms.shape[1]):
-            result = self.eval_controls(input_perms[:, i], VehicleState(0, 0, 0))
+            result = self.eval_controls(input_perms[:, i], np.zeros(3))
             mp = MotionPrimitive([InputFrame(input_perms[:, i], 1)],
-                                 [StateFrame(result, 1)])
+                                 result)
             self.motion_primitives.append(mp)
 
     def _get_default_u_disc(self):
@@ -269,7 +287,14 @@ class Robot(Vehicle):
 def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
     body_verts = body.get_world_vertices()
     body_aabb = body.get_aabb()
-    nearest_cells = obs_quadtree.query(body_aabb)
+    # expand body_aabb by 1 cell because rectquadtree.query returns rectangles with a VERTEX in the query,
+    # not intersections
+    query_aabb = (body_aabb[0] - 0.5, body_aabb[1] - 0.5, body_aabb[2] + 0.5, body_aabb[3] + 0.5)
+    nearest_cells = obs_quadtree.query(query_aabb)
+    for i in range(body_verts.shape[1]):
+        if not(0 <= body_verts[0, i] <= obs.FIELD_WIDTH and 0 <= body_verts[1, i] <= obs.FIELD_HEIGHT):
+            return True # vertex outside grid
+
     for cell in nearest_cells:
         # query returns (id, minx, miny, maxx, maxy)
         # check if corners of the cell are in the body or vice versa
@@ -327,7 +352,7 @@ if __name__ == '__main__':
     obs._cell_height = 25
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
-    obs.populate_cells(0.1, True, _canvas)
+    obs.populate_cells(0.2, True, _canvas)
 
     # start and parking spots
     obs.clear_cell(0, 0)
@@ -346,23 +371,9 @@ if __name__ == '__main__':
     #car = Vehicle(meters_to_cells(5.2), meters_to_cells(1.8))
     robot = Robot()
     _canvas.add_drawable(robot)
-    print(f'running A*')
-    path = robot.astar(MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body), (8, 11, 10, 12))
-    if path:
-        path = list(path)
-        print(f'found path: {path}')
 
-    counter = 1
-    last_x, last_y = robot.x, robot.y
     def step_time_callback():
         global counter, robot, last_x, last_y
-        if len(robot.mp_queue) < 1:
-            motion = path[counter].via
-            dx, dy = robot.x - last_x, robot.y - last_y
-            print(f'{counter}: ({robot.x}, {robot.y}) {np.sqrt(dx*dx + dy*dy)}')
-            last_x, last_y = robot.x, robot.y
-            robot.queue_motion(motion)
-            counter = (counter + 1) % len(robot.motion_primitives)
         robot.run_queued_motions(ui.time_rate/ui.fps)
         if robot.check_collision(obs.obs_quadtree):
             robot.body.fill_color = (1.0, 0, 0)
@@ -374,4 +385,16 @@ if __name__ == '__main__':
 
     obs.draw_grid()
     _frame.pack()
+
+    def run_astar():
+        print(f'running A*')
+        path = robot.astar(MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body), (8, 11, 10, 12))
+        counter = 0
+        for path_segment in path:
+            print(f'{counter}: {path_segment}')
+            if path_segment.via:
+                robot.queue_motion(path_segment.via)
+            counter += 1
+
+    _root_window.after(500, run_astar)
     _root_window.mainloop()
