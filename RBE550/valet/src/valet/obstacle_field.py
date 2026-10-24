@@ -312,6 +312,10 @@ class DrawableRect(TF2DOwner):
         self.coordinate_frame = coordinate_frame
         self.visible = visible
 
+    def copy(self):
+        return DrawableRect(self.x, self.y, self.width, self.height, self.theta, self.origin, self.fill_color,
+                            self.border_color, self.border_width, self.coordinate_frame, self.visible, self.parent)
+
     def get_local_vertices(self) -> np.ndarray:
         """
         Returns the 4 local vertices of the rectangle relative to its pose origin
@@ -1103,6 +1107,8 @@ def add_to_cell(x: int, y: int, value: Any):
     """Adds value to cell (x, y) and immediately updates _grid_colors in O(1)."""
     global _cells, _grid_colors
     _cells[y][x].append(value)
+    if value == 1:
+        obs_quadtree.insert((x, y, x + 1, y + 1))
     if _grid_colors is not None and 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
         _grid_colors[y, x] = convert_text_to_rgb(_fill_func(_cells[y][x]))
 
@@ -1114,6 +1120,14 @@ def remove_from_cell(x: int, y: int, value: Any):
     if _grid_colors is not None and 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
         _grid_colors[y, x] = convert_text_to_rgb(_fill_func(_cells[y][x]))
 
+def clear_cell(x: int, y: int):
+    global _cells, _grid_colors, obs_quadtree
+    _cells[y][x].clear()
+    obstacles = obs_quadtree.query((x, y, x + 1, y + 1))
+    for o in obstacles:
+        obs_quadtree.delete_tuple(o)
+    if _grid_colors is not None and 0 <= x < FIELD_WIDTH and 0 <= y < FIELD_HEIGHT:
+        _grid_colors[y, x] = convert_text_to_rgb(_fill_func(_cells[y][x]))
 
 def get_cells_copy() -> list[list[list[Any]]]:
     return [[_cells[y][x].copy() for x in range(len(_cells[y]))] for y in range(len(_cells))]
