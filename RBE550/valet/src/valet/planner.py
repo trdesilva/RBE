@@ -107,6 +107,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         self.state_shape = state_shape
         self.controls = controls
         self._generate_default_motion_primitives(self._get_default_u_disc())
+        self.visited_cells = set() # coordinates of cells A* has visited to trim reachability lattice
 
         self.mp_queue = [] # MotionPrimitives to execute
         self.mp_frame = 0 # which frame in mp_queue[0] is active
@@ -243,8 +244,10 @@ class Vehicle(obs.DrawableGroup, AStar):
             mp_dest = mp.states[-1].state
             mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
             mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
-            if not mp_node.check_collision(obs.obs_quadtree):
+            if (not mp_node.check_collision(obs.obs_quadtree)
+                and (int(mp_dest.x), int(mp_dest.y)) not in self.visited_cells):
                 result.append(mp_node)
+                self.visited_cells.add((int(mp_dest.x), int(mp_dest.y)))
         return result
 
     def heuristic_cost_estimate(self, current, goal) -> float:
@@ -390,6 +393,9 @@ if __name__ == '__main__':
         print(f'running A*')
         path = robot.astar(MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body), (8, 11, 10, 12))
         counter = 0
+        if path is None:
+            print(f'No path found')
+            return
         for path_segment in path:
             print(f'{counter}: {path_segment}')
             if path_segment.via:
