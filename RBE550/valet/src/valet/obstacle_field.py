@@ -9,6 +9,7 @@ Includes support for transformed 2D shapes (TF2DOwner, DrawableRect, DrawableLin
 from __future__ import annotations
 
 from collections import deque
+import ctypes
 import colorsys
 import time
 import tkinter as tk
@@ -127,18 +128,29 @@ void main() {
 _SHAPE_VERT_SRC = """
 #version 120
 attribute vec2 a_pos;
+attribute vec4 a_color;
+varying vec4 v_color;
+
+uniform vec2 u_coord_scale;
+uniform vec2 u_coord_offset;
+
 void main() {
-    gl_Position = vec4(a_pos, 0.0, 1.0);
+    vec2 ndc_pos = a_pos * u_coord_scale + u_coord_offset;
+    gl_Position = vec4(ndc_pos, 0.0, 1.0);
+    v_color = a_color;
 }
 """
 
 _SHAPE_FRAG_SRC = """
 #version 120
-uniform vec4 u_color;
+varying vec4 v_color;
 void main() {
-    gl_FragColor = u_color;
+    gl_FragColor = v_color;
 }
 """
+
+
+_rgba_cache: dict[Any, tuple[float, float, float, float]] = {}
 
 
 def parse_color_rgba(color: Any, default_alpha: float = 1.0) -> tuple[float, float, float, float]:
@@ -149,6 +161,21 @@ def parse_color_rgba(color: Any, default_alpha: float = 1.0) -> tuple[float, flo
     if color is None:
         return (0.0, 0.0, 0.0, 0.0)
 
+    # Fast path for 4-element float tuple already normalized
+    if isinstance(color, tuple):
+        if len(color) == 4 and isinstance(color[0], float) and isinstance(color[1], float) and isinstance(color[2], float) and isinstance(color[3], float):
+            if color[0] <= 1.0 and color[1] <= 1.0 and color[2] <= 1.0 and color[3] <= 1.0:
+                return color
+        cached = _rgba_cache.get(color)
+        if cached is not None:
+            return cached
+
+    if isinstance(color, str):
+        cached = _rgba_cache.get(color)
+        if cached is not None:
+            return cached
+
+    res: tuple[float, float, float, float]
     if isinstance(color, (tuple, list, np.ndarray)):
         arr = list(color)
         if len(arr) >= 4:
@@ -156,25 +183,33 @@ def parse_color_rgba(color: Any, default_alpha: float = 1.0) -> tuple[float, flo
             g = arr[1] / 255.0 if arr[1] > 1.0 else float(arr[1])
             b = arr[2] / 255.0 if arr[2] > 1.0 else float(arr[2])
             a = arr[3] / 255.0 if arr[3] > 1.0 else float(arr[3])
-            return (r, g, b, a)
+            res = (r, g, b, a)
         elif len(arr) >= 3:
             r = arr[0] / 255.0 if arr[0] > 1.0 else float(arr[0])
             g = arr[1] / 255.0 if arr[1] > 1.0 else float(arr[1])
             b = arr[2] / 255.0 if arr[2] > 1.0 else float(arr[2])
-            return (r, g, b, default_alpha)
-
-    if isinstance(color, str):
+            res = (r, g, b, default_alpha)
+        else:
+            res = (0.0, 0.0, 0.0, default_alpha)
+    elif isinstance(color, str):
         text = color.strip()
         if text.startswith('#') and len(text) == 9:  # #rrggbbaa
             r = int(text[1:3], 16) / 255.0
             g = int(text[3:5], 16) / 255.0
             b = int(text[5:7], 16) / 255.0
             a = int(text[7:9], 16) / 255.0
-            return (r, g, b, a)
-        rgb = convert_text_to_rgb(text)
-        return (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, default_alpha)
+            res = (r, g, b, a)
+        else:
+            rgb = convert_text_to_rgb(text)
+            res = (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, default_alpha)
+    else:
+        res = (0.0, 0.0, 0.0, default_alpha)
 
-    return (0.0, 0.0, 0.0, default_alpha)
+    try:
+        _rgba_cache[color] = res
+    except TypeError:
+        pass
+    return res
 
 
 class TF2DOwner:
@@ -183,21 +218,71 @@ class TF2DOwner:
     and heading theta in radians). Supports hierarchical parent-child transforms.
     All point and vector transformation APIs operate exclusively using column vectors.
     """
-    def __init__(self,
-                 x: float = 0.0,
-                 y: float = 0.0,
-                 theta: float = 0.0,
-                 parent: TF2DOwner | None = None
-                 ):
-        self.x = float(x)
-        self.y = float(y)
-        self.theta = float(theta)  # in radians
-        self.parent = parent
+    def __init__(
+        self,
+        x: float = 0.0,
+        y: float = 0.0,
+        theta: float = 0.0,
+        parent: TF2DOwner | None = None
+    ):
+        self._x = float(x)
+        self._y = float(y)
+        self._theta = float(theta)  # in radians
+        self._parent = parent
+        self._dirty_transform = True
+        self._cached_world_matrix: np.ndarray | None = None
+
+    @property
+    def x(self) -> float:
+        return self._x
+
+    @x.setter
+    def x(self, val: float):
+        fval = float(val)
+        if self._x != fval:
+            self._x = fval
+            self._mark_dirty()
+
+    @property
+    def y(self) -> float:
+        return self._y
+
+    @y.setter
+    def y(self, val: float):
+        fval = float(val)
+        if self._y != fval:
+            self._y = fval
+            self._mark_dirty()
+
+    @property
+    def theta(self) -> float:
+        return self._theta
+
+    @theta.setter
+    def theta(self, val: float):
+        fval = float(val)
+        if self._theta != fval:
+            self._theta = fval
+            self._mark_dirty()
+
+    @property
+    def parent(self) -> TF2DOwner | None:
+        return self._parent
+
+    @parent.setter
+    def parent(self, val: TF2DOwner | None):
+        if self._parent is not val:
+            self._parent = val
+            self._mark_dirty()
+
+    def _mark_dirty(self):
+        self._dirty_transform = True
+        self._cached_world_matrix = None
 
     @property
     def degrees(self) -> float:
         """Rotation angle in degrees."""
-        return float(np.degrees(self.theta))
+        return float(np.degrees(self._theta))
 
     @degrees.setter
     def degrees(self, val: float):
@@ -205,26 +290,40 @@ class TF2DOwner:
 
     def set_pose(self, x: float, y: float, theta: float | None = None):
         """Sets the position and optional heading."""
-        self.x = float(x)
-        self.y = float(y)
+        changed = False
+        fx, fy = float(x), float(y)
+        if self._x != fx:
+            self._x = fx
+            changed = True
+        if self._y != fy:
+            self._y = fy
+            changed = True
         if theta is not None:
-            self.theta = float(theta)
+            ft = float(theta)
+            if self._theta != ft:
+                self._theta = ft
+                changed = True
+        if changed:
+            self._mark_dirty()
 
     def translate(self, dx: float, dy: float):
         """Translates the transform by (dx, dy)."""
-        self.x += float(dx)
-        self.y += float(dy)
+        self._x += float(dx)
+        self._y += float(dy)
+        self._mark_dirty()
 
     def translate_rel(self, dx: float, dy: float):
         """Translates relative to current heading using column vector rotation."""
         rot = self.get_heading_transform_matrix()
         d_pos = rot @ np.array([[dx], [dy]], dtype=np.float64)
-        self.x += float(d_pos[0, 0])
-        self.y += float(d_pos[1, 0])
+        self._x += float(d_pos[0, 0])
+        self._y += float(d_pos[1, 0])
+        self._mark_dirty()
 
     def rotate(self, dtheta: float):
         """Rotates the transform by dtheta radians."""
-        self.theta += float(dtheta)
+        self._theta += float(dtheta)
+        self._mark_dirty()
 
     def get_local_transform_matrix(self) -> np.ndarray:
         """
@@ -233,20 +332,27 @@ class TF2DOwner:
          [sin(theta),  cos(theta), y],
          [         0,           0, 1]]
         """
-        c = np.cos(self.theta)
-        s = np.sin(self.theta)
+        c = np.cos(self._theta)
+        s = np.sin(self._theta)
         return np.array([
-            [c, -s, self.x],
-            [s,  c, self.y],
+            [c, -s, self._x],
+            [s,  c, self._y],
             [0.0, 0.0, 1.0],
         ], dtype=np.float64)
 
     def get_world_transform_matrix(self) -> np.ndarray:
         """Recursively computes the world transform matrix by chaining parent transforms."""
+        if not self._dirty_transform and self._cached_world_matrix is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_world_matrix
+
         local = self.get_local_transform_matrix()
-        if self.parent is not None:
-            return self.parent.get_world_transform_matrix() @ local
-        return local
+        if self._parent is not None:
+            self._cached_world_matrix = self._parent.get_world_transform_matrix() @ local
+        else:
+            self._cached_world_matrix = local
+        self._dirty_transform = False
+        return self._cached_world_matrix
 
     def get_heading_transform_matrix(self):
         """Get only the rotation part of the world transform matrix."""
@@ -274,11 +380,14 @@ class TF2DOwner:
         else:
             raise ValueError(f"Expected 1D or 2D array, got {pts.ndim}D array")
 
-        ones = np.ones((1, pts.shape[1]), dtype=np.float64)
-        h_pts = np.vstack([pts, ones])  # (3, N)
-        m = self.get_world_transform_matrix()  # (3, 3)
-        world_h = m @ h_pts  # (3, N)
-        result = world_h[:2, :]
+        m = self.get_world_transform_matrix()
+        m00, m01, m02 = m[0, 0], m[0, 1], m[0, 2]
+        m10, m11, m12 = m[1, 0], m[1, 1], m[1, 2]
+        x = pts[0, :]
+        y = pts[1, :]
+        rx = m00 * x + m01 * y + m02
+        ry = m10 * x + m11 * y + m12
+        result = np.array([rx, ry], dtype=np.float64)
 
         return result.ravel() if is_1d else result
 
@@ -312,6 +421,15 @@ class DrawableRect(TF2DOwner):
         self.border_width = float(border_width)
         self.coordinate_frame = coordinate_frame
         self.visible = visible
+        self._cached_world_vertices: np.ndarray | None = None
+        self._cached_tri_verts: np.ndarray | None = None
+        self._cached_border_verts: np.ndarray | None = None
+
+    def _mark_dirty(self):
+        super()._mark_dirty()
+        self._cached_world_vertices = None
+        self._cached_tri_verts = None
+        self._cached_border_verts = None
 
     def copy(self):
         return DrawableRect(self.x, self.y, self.width, self.height, self.theta, self.origin, self.fill_color,
@@ -338,7 +456,38 @@ class DrawableRect(TF2DOwner):
         Transforms local vertices into world (grid or root parent) coordinates
         as column vectors of shape (2, 4).
         """
-        return self.transform_points(self.get_local_vertices())
+        if not self._dirty_transform and self._cached_world_vertices is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_world_vertices
+        res = self.transform_points(self.get_local_vertices())
+        self._cached_world_vertices = res
+        return res
+
+    def get_tri_vertices(self) -> np.ndarray:
+        """
+        Returns the 6 vertices forming 2 triangles for GL_TRIANGLES in world space
+        as a (6, 2) float32 array.
+        """
+        if not self._dirty_transform and self._cached_tri_verts is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_tri_verts
+        w = self.get_world_vertices()
+        tri = np.ascontiguousarray(w.T[[0, 1, 2, 0, 2, 3]], dtype=np.float32)
+        self._cached_tri_verts = tri
+        return tri
+
+    def get_border_vertices(self) -> np.ndarray:
+        """
+        Returns the 8 vertices forming 4 border segments for GL_LINES in world space
+        as an (8, 2) float32 array.
+        """
+        if not self._dirty_transform and self._cached_border_verts is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_border_verts
+        w = self.get_world_vertices()
+        border = np.ascontiguousarray(w.T[[0, 1, 1, 2, 2, 3, 3, 0]], dtype=np.float32)
+        self._cached_border_verts = border
+        return border
 
     def get_aabb(self, qt_format = True):
         """
@@ -376,15 +525,23 @@ class DrawableLineStrip(TF2DOwner):
     ):
         super().__init__(x=x, y=y, theta=theta, parent=parent)
         self._local_vertices: np.ndarray = np.empty((2, 0), dtype=np.float64)
+        self._cached_world_vertices: np.ndarray | None = None
+        self._cached_segments: np.ndarray | None = None
         self.set_vertices(vertices)
         self.color = color
         self.line_width = float(line_width)
         self.coordinate_frame = coordinate_frame
         self.visible = visible
 
+    def _mark_dirty(self):
+        super()._mark_dirty()
+        self._cached_world_vertices = None
+        self._cached_segments = None
+
     def set_vertices(self, vertices: Any):
         if vertices is None:
             self._local_vertices = np.empty((2, 0), dtype=np.float64)
+            self._mark_dirty()
             return
         pts = np.asarray(vertices, dtype=np.float64)
         if pts.ndim == 1:
@@ -412,6 +569,7 @@ class DrawableLineStrip(TF2DOwner):
                 raise ValueError(f"Expected 2xN or Nx2 array, got {pts.shape}")
         else:
             raise ValueError(f"Expected 1D or 2D array for vertices, got {pts.ndim}D")
+        self._mark_dirty()
 
     @property
     def vertices(self) -> np.ndarray:
@@ -449,7 +607,31 @@ class DrawableLineStrip(TF2DOwner):
         """
         if self._local_vertices.shape[1] == 0:
             return np.empty((2, 0), dtype=np.float64)
-        return self.transform_points(self._local_vertices)
+        if not self._dirty_transform and self._cached_world_vertices is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_world_vertices
+        res = self.transform_points(self._local_vertices)
+        self._cached_world_vertices = res
+        return res
+
+    def get_segments(self) -> np.ndarray:
+        """
+        Returns line segments for GL_LINES in world space as an (2*(N-1), 2) float32 array.
+        """
+        if not self._dirty_transform and self._cached_segments is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_segments
+        world_pts = self.get_world_vertices()
+        n = world_pts.shape[1]
+        if n < 2:
+            self._cached_segments = np.empty((0, 2), dtype=np.float32)
+            return self._cached_segments
+
+        segs = np.empty((2 * (n - 1), 2), dtype=np.float32)
+        segs[0::2, :] = world_pts[:, :-1].T
+        segs[1::2, :] = world_pts[:, 1:].T
+        self._cached_segments = segs
+        return segs
 
     def get_aabb(self, qt_format: bool = True):
         world_verts = self.get_world_vertices()
@@ -479,12 +661,18 @@ class DrawableGroup(TF2DOwner):
         self.children: list[DrawableRect | DrawableLineStrip | DrawableGroup] = []
         self.visible = visible
 
+    def _mark_dirty(self):
+        super()._mark_dirty()
+        for child in getattr(self, 'children', ()):
+            child._mark_dirty()
+
     def add(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
         """Adds a child drawable to this group and binds this group as its parent."""
         if drawable not in self.children:
             self.children.append(drawable)
             if drawable.parent is None:
                 drawable.parent = self
+            drawable._mark_dirty()
 
     def remove(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
         """Removes a child drawable from this group."""
@@ -492,12 +680,14 @@ class DrawableGroup(TF2DOwner):
             self.children.remove(drawable)
             if drawable.parent is self:
                 drawable.parent = None
+            drawable._mark_dirty()
 
     def clear(self):
         """Removes all children from this group."""
         for child in self.children:
             if child.parent is self:
                 child.parent = None
+            child._mark_dirty()
         self.children.clear()
 
     def get_all_drawables(self) -> list[DrawableRect | DrawableLineStrip]:
@@ -537,101 +727,6 @@ class DrawableGroup(TF2DOwner):
 
     def __len__(self) -> int:
         return len(self.children)
-
-
-def vectorized_hue_to_rgb(hue_percent: np.ndarray) -> np.ndarray:
-    """
-    Pure NumPy vectorized HSV to RGB conversion for hue_percent in [0, 1]
-    mapped to hue in [120/360, 0] (Green to Red), with saturation=1.0, value=1.0.
-    Returns an (N, 3) uint8 array of RGB colors in [0, 255].
-    """
-    hp = np.asarray(hue_percent, dtype=np.float32)
-    h = (1.0 - hp) * (120.0 / 360.0) * 6.0  # h in [0, 2]
-    r = np.clip(np.where(h <= 1.0, 1.0, 2.0 - h), 0.0, 1.0)
-    g = np.clip(np.where(h <= 1.0, h, 1.0), 0.0, 1.0)
-    b = np.zeros_like(h)
-    return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
-
-
-class GridBackgroundMap:
-    """
-    High-performance 2D NumPy array-backed map for cell background values.
-    Provides a dictionary-like interface (indexing, get, pop, clear, contains, items)
-    while storing values in a contiguous (height, width) float32 array for zero-copy
-    vectorized operations.
-    """
-    def __init__(self, width: int = FIELD_WIDTH, height: int = FIELD_HEIGHT):
-        self.width = width
-        self.height = height
-        self.grid = np.full((height, width), np.nan, dtype=np.float32)
-
-    def _ensure_dimensions(self, width: int, height: int):
-        if self.width != width or self.height != height or self.grid.shape != (height, width):
-            new_grid = np.full((height, width), np.nan, dtype=np.float32)
-            common_h = min(self.height, height)
-            common_w = min(self.width, width)
-            new_grid[:common_h, :common_w] = self.grid[:common_h, :common_w]
-            self.grid = new_grid
-            self.width = width
-            self.height = height
-
-    def __setitem__(self, key: tuple[int, int], value: float):
-        x, y = key
-        if not (0 <= x < self.width and 0 <= y < self.height):
-            self._ensure_dimensions(max(self.width, x + 1), max(self.height, y + 1))
-        self.grid[y, x] = float(value)
-
-    def __getitem__(self, key: tuple[int, int]) -> float:
-        x, y = key
-        if 0 <= x < self.width and 0 <= y < self.height:
-            v = self.grid[y, x]
-            if not np.isnan(v):
-                return float(v)
-        raise KeyError(key)
-
-    def get(self, key: tuple[int, int], default: Any = None) -> Any:
-        x, y = key
-        if 0 <= x < self.width and 0 <= y < self.height:
-            v = self.grid[y, x]
-            if not np.isnan(v):
-                return float(v)
-        return default
-
-    def pop(self, key: tuple[int, int], default: Any = None) -> Any:
-        x, y = key
-        if 0 <= x < self.width and 0 <= y < self.height:
-            v = self.grid[y, x]
-            if not np.isnan(v):
-                self.grid[y, x] = np.nan
-                return float(v)
-        return default
-
-    def clear(self):
-        self.grid.fill(np.nan)
-
-    def __contains__(self, key: tuple[int, int]) -> bool:
-        x, y = key
-        if 0 <= x < self.width and 0 <= y < self.height:
-            return not np.isnan(self.grid[y, x])
-        return False
-
-    def __len__(self) -> int:
-        return int(np.count_nonzero(~np.isnan(self.grid)))
-
-    def items(self):
-        ys, xs = np.nonzero(~np.isnan(self.grid))
-        for y, x in zip(ys, xs):
-            yield (int(x), int(y)), float(self.grid[y, x])
-
-    def keys(self):
-        ys, xs = np.nonzero(~np.isnan(self.grid))
-        for y, x in zip(ys, xs):
-            yield (int(x), int(y))
-
-    def values(self):
-        vals = self.grid[~np.isnan(self.grid)]
-        for v in vals:
-            yield float(v)
 
 
 class AdaptiveGradientBackground:
@@ -890,8 +985,7 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
         GL.glDisableVertexAttribArray(loc)
 
         # -------------------------------------------------------------
-        # PASS 2: Render transformed overlay shapes in breadth-first order
-        # -------------------------------------------------------------
+        # PASS 2: Render transformed overlay shapes in batches using GPU coordinate mapping
         if self.drawables and self.shape_prog is not None:
             draw_items: list[DrawableRect | DrawableLineStrip] = []
             queue = deque(self.drawables)
@@ -914,65 +1008,102 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                 GL.glUseProgram(self.shape_prog)
 
                 loc_pos = GL.glGetAttribLocation(self.shape_prog, 'a_pos')
-                loc_col = GL.glGetUniformLocation(self.shape_prog, 'u_color')
+                loc_col = GL.glGetAttribLocation(self.shape_prog, 'a_color')
+                loc_scale = GL.glGetUniformLocation(self.shape_prog, 'u_coord_scale')
+                loc_offset = GL.glGetUniformLocation(self.shape_prog, 'u_coord_offset')
+
                 GL.glEnableVertexAttribArray(loc_pos)
+                GL.glEnableVertexAttribArray(loc_col)
                 GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.shape_vbo)
+
+                vw = max(float(self.width), 1.0)
+                vh = max(float(self.height), 1.0)
+                margin = 2.0 * self.cell_border
+                stride_x = self.cell_size[0] + self.cell_border
+                stride_y = self.cell_size[1] + self.cell_border
+
+                coord_params = {
+                    "grid": (
+                        (2.0 * stride_x / vw, -2.0 * stride_y / vh),
+                        (2.0 * margin / vw - 1.0, 1.0 - 2.0 * margin / vh),
+                    ),
+                    "pixel": (
+                        (2.0 / vw, -2.0 / vh),
+                        (-1.0, 1.0),
+                    )
+                }
+
+                # 1. Collect filled rectangles: frame -> list of (tri_verts, fill_rgba)
+                rect_fills: dict[str, list[tuple[np.ndarray, tuple[float, float, float, float]]]] = {}
+                # 2. Collect rectangle borders: (frame, border_width) -> list of (border_verts, border_rgba)
+                rect_borders: dict[tuple[str, float], list[tuple[np.ndarray, tuple[float, float, float, float]]]] = {}
+                # 3. Collect line strips: (frame, line_width) -> list of (segs, color_rgba)
+                line_strips: dict[tuple[str, float], list[tuple[np.ndarray, tuple[float, float, float, float]]]] = {}
 
                 for item in draw_items:
                     if isinstance(item, DrawableRect):
-                        world_pts = item.get_world_vertices()  # (2, 4) column vectors
-                        if item.coordinate_frame == "grid":
-                            pixel_pts = self.grid_to_pixel(world_pts)  # (2, 4) column vectors
-                        else:
-                            pixel_pts = world_pts
-                        ndc_pts = self.pixel_to_ndc(pixel_pts)  # (2, 4) column vectors
-
-                        # Implementation detail: OpenGL buffer expects row vectors (4, 2)
-                        ndc_pts_row = ndc_pts.T
-
-                        # Filled quad (2 triangles: 0-1-2 and 0-2-3)
                         fill_rgba = parse_color_rgba(item.fill_color)
                         if fill_rgba[3] > 0.0:
-                            tri_verts = np.array([
-                                ndc_pts_row[0], ndc_pts_row[1], ndc_pts_row[2],
-                                ndc_pts_row[0], ndc_pts_row[2], ndc_pts_row[3],
-                            ], dtype=np.float32)
-                            GL.glUniform4f(loc_col, *fill_rgba)
-                            GL.glBufferData(GL.GL_ARRAY_BUFFER, tri_verts.nbytes, tri_verts, GL.GL_DYNAMIC_DRAW)
-                            GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
-                            GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
+                            frame = item.coordinate_frame if item.coordinate_frame in coord_params else "grid"
+                            tri_v = item.get_tri_vertices()
+                            if tri_v.shape[0] > 0:
+                                rect_fills.setdefault(frame, []).append((tri_v, fill_rgba))
 
-                        # Outline border (line loop: 0-1-2-3)
                         if item.border_color is not None and item.border_width > 0.0:
                             border_rgba = parse_color_rgba(item.border_color)
                             if border_rgba[3] > 0.0:
-                                line_verts = np.ascontiguousarray(ndc_pts_row, dtype=np.float32)
-                                GL.glLineWidth(max(1.0, float(item.border_width)))
-                                GL.glUniform4f(loc_col, *border_rgba)
-                                GL.glBufferData(GL.GL_ARRAY_BUFFER, line_verts.nbytes, line_verts, GL.GL_DYNAMIC_DRAW)
-                                GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
-                                GL.glDrawArrays(GL.GL_LINE_LOOP, 0, 4)
+                                frame = item.coordinate_frame if item.coordinate_frame in coord_params else "grid"
+                                b_width = max(1.0, float(item.border_width))
+                                b_v = item.get_border_vertices()
+                                if b_v.shape[0] > 0:
+                                    rect_borders.setdefault((frame, b_width), []).append((b_v, border_rgba))
 
                     elif isinstance(item, DrawableLineStrip):
-                        world_pts = item.get_world_vertices()  # (2, N) column vectors
-                        if world_pts.shape[1] < 2:
-                            continue
-                        if item.coordinate_frame == "grid":
-                            pixel_pts = self.grid_to_pixel(world_pts)
-                        else:
-                            pixel_pts = world_pts
-                        ndc_pts = self.pixel_to_ndc(pixel_pts)  # (2, N)
-                        ndc_pts_row = np.ascontiguousarray(ndc_pts.T, dtype=np.float32)
+                        c_rgba = parse_color_rgba(item.color)
+                        if c_rgba[3] > 0.0:
+                            segs = item.get_segments()
+                            if segs.shape[0] > 0:
+                                frame = item.coordinate_frame if item.coordinate_frame in coord_params else "grid"
+                                l_width = max(1.0, float(item.line_width))
+                                line_strips.setdefault((frame, l_width), []).append((segs, c_rgba))
 
-                        color_rgba = parse_color_rgba(item.color)
-                        if color_rgba[3] > 0.0:
-                            GL.glLineWidth(max(1.0, float(item.line_width)))
-                            GL.glUniform4f(loc_col, *color_rgba)
-                            GL.glBufferData(GL.GL_ARRAY_BUFFER, ndc_pts_row.nbytes, ndc_pts_row, GL.GL_DYNAMIC_DRAW)
-                            GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
-                            GL.glDrawArrays(GL.GL_LINE_STRIP, 0, ndc_pts_row.shape[0])
+                def _draw_batch(items: list[tuple[np.ndarray, tuple[float, float, float, float]]], mode: int):
+                    total_v = sum(it[0].shape[0] for it in items)
+                    buf = np.empty((total_v, 6), dtype=np.float32)
+                    np.concatenate([it[0] for it in items], out=buf[:, :2])
+                    counts = [it[0].shape[0] for it in items]
+                    colors = np.array([it[1] for it in items], dtype=np.float32)
+                    buf[:, 2:] = np.repeat(colors, counts, axis=0)
+                    GL.glBufferData(GL.GL_ARRAY_BUFFER, buf.nbytes, buf, GL.GL_DYNAMIC_DRAW)
+                    GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 24, None)
+                    GL.glVertexAttribPointer(loc_col, 4, GL.GL_FLOAT, GL.GL_FALSE, 24, ctypes.c_void_p(8))
+                    GL.glDrawArrays(mode, 0, total_v)
+
+                # Render Rect Fills (GL_TRIANGLES)
+                for frame, items in rect_fills.items():
+                    scale, offset = coord_params[frame]
+                    GL.glUniform2f(loc_scale, *scale)
+                    GL.glUniform2f(loc_offset, *offset)
+                    _draw_batch(items, GL.GL_TRIANGLES)
+
+                # Render Rect Borders (GL_LINES)
+                for (frame, b_width), items in rect_borders.items():
+                    scale, offset = coord_params[frame]
+                    GL.glUniform2f(loc_scale, *scale)
+                    GL.glUniform2f(loc_offset, *offset)
+                    GL.glLineWidth(b_width)
+                    _draw_batch(items, GL.GL_LINES)
+
+                # Render Line Strips (GL_LINES)
+                for (frame, l_width), items in line_strips.items():
+                    scale, offset = coord_params[frame]
+                    GL.glUniform2f(loc_scale, *scale)
+                    GL.glUniform2f(loc_offset, *offset)
+                    GL.glLineWidth(l_width)
+                    _draw_batch(items, GL.GL_LINES)
 
                 GL.glDisableVertexAttribArray(loc_pos)
+                GL.glDisableVertexAttribArray(loc_col)
                 GL.glDisable(GL.GL_BLEND)
 
     # Tkinter Canvas compatibility stubs
