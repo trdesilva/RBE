@@ -33,7 +33,7 @@ _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
 _bg_rects: list[Any] = []
 _fill_func = lambda value: 'black' if value is not None and len(value) > 0 and value[0] > 0 else 'white'
 
-obs_quadtree = None
+obs_quadtree = qt.RectQuadTree((0, 0, FIELD_WIDTH, FIELD_HEIGHT), 10)
 
 _cell_width = 6
 _cell_height = 6
@@ -505,6 +505,11 @@ class DrawableRect(TF2DOwner):
         # fastquadtree convention (minx, miny, maxx, maxy), else two column vectors
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 
+    def is_bounded_by(self, qt_rect):
+        for v in self.get_world_vertices():
+            if not(qt_rect[0] <= v[0] <= qt_rect[2] and qt_rect[1] <= v[1] <= qt_rect[3]):
+                return False
+        return True
 
 class DrawableLineStrip(TF2DOwner):
     """
@@ -642,7 +647,6 @@ class DrawableLineStrip(TF2DOwner):
         maxx = float(np.max(world_verts[0, :]))
         maxy = float(np.max(world_verts[1, :]))
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
-
 
 class DrawableGroup(TF2DOwner):
     """

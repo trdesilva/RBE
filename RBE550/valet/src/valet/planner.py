@@ -98,7 +98,7 @@ class MPSearchNode(obs.TF2DOwner):
         return f'(({self.via.inputs[0].u if self.via is not None else '0,0'}) at ({self.x, self.y, self.theta}))'
 
 class Vehicle(obs.DrawableGroup, AStar):
-    def __init__(self, length, width, x = -1, y = -1, theta = -1, controls = 3, state_shape = (3, 1), canvas = None):
+    def __init__(self, length, width, x = -1, y = -1, theta = -1, controls = 3, state_shape = (3, 1), canvas = None, visited_density = 1):
         global _canvas
         parent_canvas = canvas if canvas is not None else _canvas
         # default starting location is top-left facing down
@@ -120,6 +120,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         self.controls = controls
         self._generate_default_motion_primitives(self._get_default_u_disc())
         self.visited_cells = set() # coordinates of cells A* has visited to trim reachability lattice
+        self.visited_density = visited_density # linear density of visited_cells relative to grid
 
         self.canvas = parent_canvas if parent_canvas is not None else obs._active_widget
         self.cost_values: dict[Any, float] = {}
@@ -171,7 +172,7 @@ class Vehicle(obs.DrawableGroup, AStar):
             self.theta += result[-1].state.theta
         return result
 
-    def _generate_default_motion_primitives(self, u_disc: list[np.ndarray]):
+    def _generate_default_motion_primitives(self, u_disc: list[np.ndarray], dt = 1.):
         """
         Generate a set of motion primitives for discretizing the path search space and store them in
         self.motion_primitives. This assumes that self.controls is set correctly (see _make_controls). The base
@@ -182,6 +183,10 @@ class Vehicle(obs.DrawableGroup, AStar):
         values for one component of the action vector that serves as an input to the control functions.
         :return: None
         """
+        self.motion_primitives = self.generate_motion_primitives(self._get_default_u_disc())
+        print(self.motion_primitives)
+
+    def generate_motion_primitives(self, u_disc: list[np.ndarray], dt = 1.):
         # enumerate lowest, closest to 0, and highest inputs
         assert self.controls == len(u_disc), f'u_disc has incorrect number of controls: {len(u_disc)}'
         basic_inputs = []
@@ -194,13 +199,13 @@ class Vehicle(obs.DrawableGroup, AStar):
             ]))
 
         basic_input_perms = _permute_vectors(basic_inputs)
-        self.motion_primitives = []
+        motion_primitives = []
         for i in range(basic_input_perms.shape[1]):
-            result = self.eval_controls(basic_input_perms[:, i], np.zeros(3))
-            mp = MotionPrimitive([InputFrame(basic_input_perms[:, i], 1)],
+            result = self.eval_controls(basic_input_perms[:, i], np.zeros(3), dt=dt)
+            mp = MotionPrimitive([InputFrame(basic_input_perms[:, i], dt)],
                                  result)
-            self.motion_primitives.append(mp)
-        print(self.motion_primitives)
+            motion_primitives.append(mp)
+        return motion_primitives
 
     def queue_motion(self, mp: MotionPrimitive):
         self.mp_queue.append(mp)
@@ -389,7 +394,9 @@ class Vehicle(obs.DrawableGroup, AStar):
             mp_dest = mp.states[-1].state
             mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
             mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
-            world_coord = (int(mp_dest_world[0]), int(mp_dest_world[1]), int(mp_dest.theta/(np.pi/4)))
+            world_coord = (int(mp_dest_world[0]*self.visited_density),
+                           int(mp_dest_world[1]*self.visited_density),
+                           int(mp_dest.theta/(np.pi/4)))
 
             if mp_node.check_collision(obs.obs_quadtree):
                 self._draw_colliding_neighbor(node, mp, mp_node)
@@ -416,7 +423,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         return result
 
     def is_goal_reached(self, current: T, goal: T) -> bool:
-        return goal[0] <= current.x <= goal[2] and goal[1] <= current.y <= goal[3]
+        return current._body.is_bounded_by(goal)
 
     def astar(self, start: T, goal: T, reversePath: bool = False):
         path = super().astar(start, goal, reversePath)
@@ -432,7 +439,7 @@ class Vehicle(obs.DrawableGroup, AStar):
 
 class Robot(Vehicle):
     def __init__(self, canvas = None):
-        Vehicle.__init__(self, length=meters_to_cells(.7), width=meters_to_cells(.57), controls=2, canvas=canvas)
+        Vehicle.__init__(self, length=meters_to_cells(.7), width=meters_to_cells(.57), controls=2, canvas=canvas, visited_density=5)
         self.body.fill_color = (0, 0.8, 0)
         self.body.border_color = (0, 0, 0, 0.5)
 
@@ -456,12 +463,49 @@ class Car(Vehicle):
         self.body.fill_color = (0, 0.7, 0)
         self.body.border_color = (0, 0, 0, 0.5)
 
+        self.mps_by_dt = {1.5: self.generate_motion_primitives(self._get_default_u_disc(), 1.5),
+                          1: self.generate_motion_primitives(self._get_default_u_disc(), 1),
+                          0.5: self.generate_motion_primitives(self._get_default_u_disc(), 0.5),
+                          0.1: self.generate_motion_primitives(self._get_default_u_disc(), 0.1),
+                          0.01: self.generate_motion_primitives(self._get_default_u_disc(), 0.01)}
+
     def _make_controls(self, u, s0):
         return lambda t, s: np.array([u[0]*np.cos(s[2]), u[0]*np.sin(s[2]), u[0]*u[1]])
 
     def _get_default_u_disc(self):
-        return [np.array([-1.5, 0, 1.5]),
+        return [np.array([-1, 0, 1]),
                 np.linspace(-np.pi/4, np.pi/4, 5)]
+
+    def neighbors(self, node: T) -> Iterable[T]:
+        body_verts = node._body.get_world_vertices()
+        def get_nearest_cell_center(v):
+            return np.apply_along_axis(np.average, # take the average...
+                                       1, # ... along rows...
+                                       obs.obs_quadtree.nearest_neighbor_np((v[0], v[1]))[1]
+                                        .reshape(2,2).T) # ... of min and max points as column vectors
+        nearest_cells = np.apply_along_axis(get_nearest_cell_center, 0, body_verts)
+        nearest_dist = np.min(np.linalg.norm(nearest_cells - body_verts, axis=1))
+        self.motion_primitives.clear()
+        for dt, mps in self.mps_by_dt.items():
+            if nearest_dist >= dt:
+                self.motion_primitives.extend(mps)
+                result = super().neighbors(node)
+                if len(result) > 0:
+                    return result
+        return []
+
+    def heuristic_cost_estimate(self, current, goal) -> float:
+        gx = (goal[0] + goal[2])/2.
+        gy = (goal[1] + goal[3])/2.
+        dist_to_goal = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
+        max_dist_to_goal = float(np.sqrt(gx ** 2 + gy ** 2))
+        xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
+        angle_to_goal = np.atan2(gx - current.x, gy - current.y)
+        # prefer pointing at goal when far away and being parallel with goal when close
+        heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (abs(current.theta) % np.pi)
+        result = dist_to_goal + heading_heur
+        self._update_heuristic_display(current, result)
+        return result
 
 def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
     body_verts = body.get_world_vertices()
@@ -534,7 +578,7 @@ if __name__ == '__main__':
     obs._cell_height = 25
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
-    obs.populate_cells(0.2, True, _canvas)
+    obs.populate_cells(0.0, True, _canvas)
 
     # start and parking spots
     obs.clear_cell(0, 0)

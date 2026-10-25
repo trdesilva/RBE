@@ -6,7 +6,7 @@
       <excludeFolder url="file://$MODULE_DIR$/RBE550/flatland/.venv" />
     </content>
     <orderEntry type="sourceFolder" forTests="false" />
-    <orderEntry type="module" module-name="turtles" exported="" />
+    <orderEntry type="module" module-name="valet" exported="" />
     <orderEntry type="jdk" jdkName="G:\src\RBE\RBE550\flatland\.venv" jdkType="Python SDK" />
   </component>
 </module>
