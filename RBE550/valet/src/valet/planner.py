@@ -104,7 +104,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         # default starting location is top-left facing down
         # (clockwise is positive in screenspace because +y is down)
         if theta == -1:
-            theta = 0 #-np.pi/2
+            theta = np.pi/2
         if x == -1:
             x = abs(np.cos(theta))*np.ceil(length)/2.0 + abs(np.sin(theta))*np.ceil(width)/2.0
         if y == -1:
@@ -433,8 +433,8 @@ class Vehicle(obs.DrawableGroup, AStar):
 class Robot(Vehicle):
     def __init__(self, canvas = None):
         Vehicle.__init__(self, length=meters_to_cells(.7), width=meters_to_cells(.57), controls=2, canvas=canvas)
-        self.children[0].fill_color = (0, 0.8, 0)
-        self.children[0].border_color = (0, 0, 0, 0.5)
+        self.body.fill_color = (0, 0.8, 0)
+        self.body.border_color = (0, 0, 0, 0.5)
 
         self.generate_special_motion_primitives()
 
@@ -450,9 +450,18 @@ class Robot(Vehicle):
                                  result)
             self.motion_primitives.append(mp)
 
+class Car(Vehicle):
+    def __init__(self, canvas = None):
+        Vehicle.__init__(self, length=meters_to_cells(5.2), width=meters_to_cells(1.8), controls=2, canvas=canvas)
+        self.body.fill_color = (0, 0.7, 0)
+        self.body.border_color = (0, 0, 0, 0.5)
+
+    def _make_controls(self, u, s0):
+        return lambda t, s: np.array([u[0]*np.cos(s[2]), u[0]*np.sin(s[2]), u[0]*u[1]])
+
     def _get_default_u_disc(self):
         return [np.array([-1.5, 0, 1.5]),
-                np.linspace(-np.pi/2, np.pi/2, 5)]
+                np.linspace(-np.pi/4, np.pi/4, 5)]
 
 def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
     body_verts = body.get_world_vertices()
@@ -461,9 +470,12 @@ def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
     # not intersections
     query_aabb = (body_aabb[0] - 0.5, body_aabb[1] - 0.5, body_aabb[2] + 0.5, body_aabb[3] + 0.5)
     nearest_cells = obs_quadtree.query(query_aabb)
+    verts_oob_count = 0
     for i in range(body_verts.shape[1]):
         if not(0 <= body_verts[0, i] <= obs.FIELD_WIDTH and 0 <= body_verts[1, i] <= obs.FIELD_HEIGHT):
-            return True # vertex outside grid
+            verts_oob_count += 1
+    if verts_oob_count >= 4:
+        return True # Vehicle has entirely left the map
 
     for cell in nearest_cells:
         # query returns (id, minx, miny, maxx, maxy)
@@ -539,7 +551,7 @@ if __name__ == '__main__':
     _canvas.add_drawable(goal_rect)
 
     #car = Vehicle(meters_to_cells(5.2), meters_to_cells(1.8))
-    robot = Robot()
+    robot = Car()
     _canvas.add_drawable(robot)
 
     def step_time_callback():
