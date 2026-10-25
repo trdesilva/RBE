@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from astar import AStar, T, SearchNode
 import numpy as np
@@ -95,10 +95,10 @@ class MPSearchNode(obs.TF2DOwner):
             return True # off the map collides with edge of grid
 
     def __repr__(self):
-        return f'(({self.via.inputs[0].u if self.via is not None else '0,0'}) at ({self.x, self.y, self.theta}))'
+        return f'(({self.via.inputs[0].u if self.via is not None else "0,0"}) at ({self.x, self.y, self.theta}))'
 
 class Vehicle(obs.DrawableGroup, AStar):
-    def __init__(self, length, width, x = -1, y = -1, theta = -1, controls = 3, state_shape = (3, 1), canvas = None, visited_density = 1):
+    def __init__(self, length, width, x = -1, y = -1, theta = -1, controls = 3, state_shape = (3, 1), canvas = None, visited_density = 1, render_period = 1):
         global _canvas
         parent_canvas = canvas if canvas is not None else _canvas
         # default starting location is top-left facing down
@@ -121,6 +121,8 @@ class Vehicle(obs.DrawableGroup, AStar):
         self._generate_default_motion_primitives(self._get_default_u_disc())
         self.visited_cells = set() # coordinates of cells A* has visited to trim reachability lattice
         self.visited_density = visited_density # linear density of visited_cells relative to grid
+        self.render_period = render_period
+        self._neighbor_count = 0
 
         self.canvas = parent_canvas if parent_canvas is not None else obs._active_widget
         self.cost_values: dict[Any, float] = {}
@@ -183,20 +185,23 @@ class Vehicle(obs.DrawableGroup, AStar):
         values for one component of the action vector that serves as an input to the control functions.
         :return: None
         """
-        self.motion_primitives = self.generate_motion_primitives(self._get_default_u_disc())
+        self.motion_primitives = self.generate_motion_primitives(self._get_default_u_disc(), dt=dt, simplify=True)
         print(self.motion_primitives)
 
-    def generate_motion_primitives(self, u_disc: list[np.ndarray], dt = 1.):
+    def generate_motion_primitives(self, u_disc: list[np.ndarray], dt = 1., simplify = True):
         # enumerate lowest, closest to 0, and highest inputs
         assert self.controls == len(u_disc), f'u_disc has incorrect number of controls: {len(u_disc)}'
         basic_inputs = []
-        for i in range(len(u_disc)):
-            u_disc[i].sort()
-            basic_inputs.append(np.array([
-                u_disc[i][0],
-                np.sort(np.abs(u_disc[i]))[0],
-                u_disc[i][len(u_disc[i]) - 1]
-            ]))
+        if simplify:
+            for i in range(len(u_disc)):
+                u_disc[i].sort()
+                basic_inputs.append(np.array([
+                    u_disc[i][0],
+                    np.sort(np.abs(u_disc[i]))[0],
+                    u_disc[i][len(u_disc[i]) - 1]
+                ]))
+        else:
+            basic_inputs = u_disc
 
         basic_input_perms = _permute_vectors(basic_inputs)
         motion_primitives = []
@@ -265,6 +270,34 @@ class Vehicle(obs.DrawableGroup, AStar):
     UI and visualization methods
     """
 
+    def clear_visualizations(self):
+        """Clears all visualized motion primitives and search lines from the canvas and vehicle state."""
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        for strip in self.collision_line_strips:
+            if canvas is not None and getattr(canvas, 'drawables', None) is not None:
+                if strip in canvas.drawables:
+                    canvas.remove_drawable(strip)
+        for node in self.search_nodes_with_strips:
+            strip = getattr(node, 'line_strip', None)
+            if strip is not None and canvas is not None and getattr(canvas, 'drawables', None) is not None:
+                if strip in canvas.drawables:
+                    canvas.remove_drawable(strip)
+        for strip in self.optimal_path_line_strips:
+            if strip is not None and canvas is not None and getattr(canvas, 'drawables', None) is not None:
+                if strip in canvas.drawables:
+                    canvas.remove_drawable(strip)
+
+        self.collision_line_strips.clear()
+        self.search_nodes_with_strips.clear()
+        self.optimal_path_line_strips.clear()
+        self.cost_values.clear()
+        self.heur_values.clear()
+        self.gradient_values.clear()
+        self.visited_cells.clear()
+
+        if canvas is not None and getattr(canvas, 'context_created', False):
+            canvas.redraw()
+
     def get_gradient_color(self, value: float) -> str:
         self.gradient_values.append(float(value))
         if len(self.gradient_values) > 1:
@@ -277,7 +310,7 @@ class Vehicle(obs.DrawableGroup, AStar):
     def _refresh_display(self):
         canvas = self.canvas if self.canvas is not None else obs._active_widget
         if canvas is not None and getattr(canvas, 'context_created', False) and canvas.winfo_ismapped():
-            canvas.display()
+            self.update_visualization()
             canvas.update()
 
     def _draw_colliding_neighbor(self, node, mp: MotionPrimitive, mp_node: MPSearchNode):
@@ -394,8 +427,8 @@ class Vehicle(obs.DrawableGroup, AStar):
             mp_dest = mp.states[-1].state
             mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
             mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
-            world_coord = (int(mp_dest_world[0]*self.visited_density),
-                           int(mp_dest_world[1]*self.visited_density),
+            world_coord = (int(mp_dest_world[0]*self.visited_density)/self.visited_density,
+                           int(mp_dest_world[1]*self.visited_density)/self.visited_density,
                            int(mp_dest.theta/(np.pi/4)))
 
             if mp_node.check_collision(obs.obs_quadtree):
@@ -411,7 +444,13 @@ class Vehicle(obs.DrawableGroup, AStar):
     def heuristic_cost_estimate(self, current, goal) -> float:
         gx = (goal[0] + goal[2])/2.
         gy = (goal[1] + goal[3])/2.
-        result = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
+        dist_to_goal = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
+        max_dist_to_goal = float(np.sqrt(gx ** 2 + gy ** 2))
+        xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
+        angle_to_goal = np.atan2(gx - current.x, gy - current.y)
+        # prefer pointing at goal when far away and being parallel with goal when close
+        heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (abs(current.theta) % np.pi)
+        result = dist_to_goal + heading_heur
         self._update_heuristic_display(current, result)
         return result
 
@@ -457,40 +496,60 @@ class Robot(Vehicle):
                                  result)
             self.motion_primitives.append(mp)
 
-class Car(Vehicle):
-    def __init__(self, canvas = None):
-        Vehicle.__init__(self, length=meters_to_cells(5.2), width=meters_to_cells(1.8), controls=2, canvas=canvas)
+class _CarMeta(type(Vehicle)):
+    _cached_mps_by_dt = None
+
+    @property
+    def mps_by_dt(cls):
+        if cls._cached_mps_by_dt is None:
+            car_inst = cls(canvas=None)
+            cls._cached_mps_by_dt = car_inst.mps_by_dt
+        return cls._cached_mps_by_dt
+
+class Car(Vehicle, metaclass=_CarMeta):
+    def __init__(self, wheelbase_length=2.8, canvas = None, render_period = 1):
+        Vehicle.__init__(self, length=meters_to_cells(5.2), width=meters_to_cells(1.8), controls=2, canvas=canvas, render_period=render_period)
         self.body.fill_color = (0, 0.7, 0)
         self.body.border_color = (0, 0, 0, 0.5)
+        wheelbase_ratio = meters_to_cells(wheelbase_length/2.)/meters_to_cells(5.2)
+        self.body.origin = (0.5 - wheelbase_ratio, 0.5)
+        self.forward.x = meters_to_cells(wheelbase_length/2.)
 
-        self.mps_by_dt = {1.5: self.generate_motion_primitives(self._get_default_u_disc(), 1.5),
-                          1: self.generate_motion_primitives(self._get_default_u_disc(), 1),
-                          0.5: self.generate_motion_primitives(self._get_default_u_disc(), 0.5),
-                          0.1: self.generate_motion_primitives(self._get_default_u_disc(), 0.1),
-                          0.01: self.generate_motion_primitives(self._get_default_u_disc(), 0.01)}
+        self.mps_by_dt = {1.5: self.generate_motion_primitives(self._get_default_u_disc(), 1.5, False),
+                          1: self.generate_motion_primitives(self._get_default_u_disc(), 1, False),
+                          0.5: self.generate_motion_primitives(self._get_default_u_disc(), 0.5, False),
+                          0.1: self.generate_motion_primitives(self._get_default_u_disc(), 0.1, False),
+                          0.01: self.generate_motion_primitives(self._get_default_u_disc(), 0.01, False)}
 
     def _make_controls(self, u, s0):
         return lambda t, s: np.array([u[0]*np.cos(s[2]), u[0]*np.sin(s[2]), u[0]*u[1]])
 
     def _get_default_u_disc(self):
-        return [np.array([-1, 0, 1]),
-                np.linspace(-np.pi/4, np.pi/4, 5)]
+        return [np.array([-1, 1]),
+                np.linspace(-np.pi/4, np.pi/4, 3)]
 
     def neighbors(self, node: T) -> Iterable[T]:
         body_verts = node._body.get_world_vertices()
         def get_nearest_cell_center(v):
+            nn = obs.obs_quadtree.nearest_neighbor_np((v[0], v[1]))
+            if nn is None or nn[1] is None:
+                return np.array([float('inf'), float('inf')])
             return np.apply_along_axis(np.average, # take the average...
                                        1, # ... along rows...
-                                       obs.obs_quadtree.nearest_neighbor_np((v[0], v[1]))[1]
-                                        .reshape(2,2).T) # ... of min and max points as column vectors
+                                       nn[1].reshape(2,2).T) # ... of min and max points as column vectors
         nearest_cells = np.apply_along_axis(get_nearest_cell_center, 0, body_verts)
-        nearest_dist = np.min(np.linalg.norm(nearest_cells - body_verts, axis=1))
+        nearest_dist = np.min(np.linalg.norm(nearest_cells - body_verts, axis=1))\
+        
         self.motion_primitives.clear()
         for dt, mps in self.mps_by_dt.items():
             if nearest_dist >= dt:
                 self.motion_primitives.extend(mps)
                 result = super().neighbors(node)
                 if len(result) > 0:
+                    self._neighbor_count += len(result)
+                    if self.render_period > 0 and self._neighbor_count >= self.render_period:
+                        self._neighbor_count = 0
+                        self._refresh_display()
                     return result
         return []
 
@@ -606,15 +665,18 @@ if __name__ == '__main__':
             ui._current_time_rate = 0
             print(f'robot crashed')
         robot.update_visualization()
+        ui.update_preview_pose()
         _canvas.redraw()
 
     ui.step_time_callback = step_time_callback
+    ui.set_active_vehicle(robot)
+    ui.clear_visualization_callback = robot.clear_visualizations
 
     obs.draw_grid()
     _frame.pack()
 
     def run_astar():
-        print(f'running A*')
+        print(f'running A* from {robot.x, robot.y, robot.theta}')
         path = robot.astar(MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body), (8, 11, 10, 12))
         counter = 0
         if path is None:
@@ -635,5 +697,5 @@ if __name__ == '__main__':
         if _canvas is not None and getattr(_canvas, 'context_created', False):
             _canvas.display()
 
-    _root_window.after(500, run_astar)
+    ui.run_astar_callback = run_astar
     _root_window.mainloop()
