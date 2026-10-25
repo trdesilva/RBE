@@ -3,11 +3,12 @@
 Replaces the Tkinter Canvas object with an OpenGL-backed widget (ObstacleFieldWidget)
 using pyopengltk and PyOpenGL for hardware-accelerated grid rendering.
 Optimized with pure vectorized NumPy operations to eliminate Python for-loops.
-Includes support for transformed 2D shapes (TF2DOwner, DrawableRect, DrawableGroup).
+Includes support for transformed 2D shapes (TF2DOwner, DrawableRect, DrawableLineStrip, DrawableGroup).
 """
 
 from __future__ import annotations
 
+from collections import deque
 import colorsys
 import time
 import tkinter as tk
@@ -356,6 +357,111 @@ class DrawableRect(TF2DOwner):
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 
 
+class DrawableLineStrip(TF2DOwner):
+    """
+    A transformable 2D line strip drawable on the grid or in screen pixels.
+    All vertex APIs return column vectors of shape (2, N).
+    """
+    def __init__(
+        self,
+        vertices: Any = None,
+        x: float = 0.0,
+        y: float = 0.0,
+        theta: float = 0.0,
+        color: Any = (0.0, 1.0, 0.0, 1.0),
+        line_width: float = 1.5,
+        coordinate_frame: str = "grid",  # "grid" or "pixel"
+        visible: bool = True,
+        parent: TF2DOwner | None = None,
+    ):
+        super().__init__(x=x, y=y, theta=theta, parent=parent)
+        self._local_vertices: np.ndarray = np.empty((2, 0), dtype=np.float64)
+        self.set_vertices(vertices)
+        self.color = color
+        self.line_width = float(line_width)
+        self.coordinate_frame = coordinate_frame
+        self.visible = visible
+
+    def set_vertices(self, vertices: Any):
+        if vertices is None:
+            self._local_vertices = np.empty((2, 0), dtype=np.float64)
+            return
+        pts = np.asarray(vertices, dtype=np.float64)
+        if pts.ndim == 1:
+            if pts.size == 0:
+                self._local_vertices = np.empty((2, 0), dtype=np.float64)
+            elif pts.shape[0] == 2:
+                # 2-element vector (dx, dy): line segment from (0, 0) to (dx, dy)
+                self._local_vertices = np.array([[0.0, pts[0]], [0.0, pts[1]]], dtype=np.float64)
+            elif pts.shape[0] == 4:
+                # 4-element vector (x0, y0, x1, y1)
+                self._local_vertices = np.array([[pts[0], pts[2]], [pts[1], pts[3]]], dtype=np.float64)
+            else:
+                raise ValueError(f"Expected 2-element or 4-element vector, got shape {pts.shape}")
+        elif pts.ndim == 2:
+            if pts.shape[0] == 2 and pts.shape[1] != 2:
+                self._local_vertices = pts
+            elif pts.shape[1] == 2 and pts.shape[0] != 2:
+                self._local_vertices = pts.T
+            elif pts.shape == (2, 2):
+                if isinstance(vertices, np.ndarray):
+                    self._local_vertices = pts
+                else:
+                    self._local_vertices = pts.T
+            else:
+                raise ValueError(f"Expected 2xN or Nx2 array, got {pts.shape}")
+        else:
+            raise ValueError(f"Expected 1D or 2D array for vertices, got {pts.ndim}D")
+
+    @property
+    def vertices(self) -> np.ndarray:
+        return self._local_vertices
+
+    @vertices.setter
+    def vertices(self, val: Any):
+        self.set_vertices(val)
+
+    def copy(self) -> DrawableLineStrip:
+        new_strip = DrawableLineStrip(
+            vertices=None,
+            x=self.x,
+            y=self.y,
+            theta=self.theta,
+            color=self.color,
+            line_width=self.line_width,
+            coordinate_frame=self.coordinate_frame,
+            visible=self.visible,
+            parent=self.parent,
+        )
+        new_strip._local_vertices = np.copy(self._local_vertices)
+        return new_strip
+
+    def get_local_vertices(self) -> np.ndarray:
+        """
+        Returns local vertices as column vectors of shape (2, N).
+        """
+        return self._local_vertices
+
+    def get_world_vertices(self) -> np.ndarray:
+        """
+        Transforms local vertices into world (grid or root parent) coordinates
+        as column vectors of shape (2, N).
+        """
+        if self._local_vertices.shape[1] == 0:
+            return np.empty((2, 0), dtype=np.float64)
+        return self.transform_points(self._local_vertices)
+
+    def get_aabb(self, qt_format: bool = True):
+        world_verts = self.get_world_vertices()
+        if world_verts.shape[1] == 0:
+            return (self.x, self.y, self.x, self.y) if qt_format else np.array(((self.x, self.x), (self.y, self.y)))
+        minx = float(np.min(world_verts[0, :]))
+        miny = float(np.min(world_verts[1, :]))
+        maxx = float(np.max(world_verts[0, :]))
+        maxy = float(np.max(world_verts[1, :]))
+        return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
+
+
 class DrawableGroup(TF2DOwner):
     """
     A composite collection of DrawableRects and nested DrawableGroups that share
@@ -370,16 +476,17 @@ class DrawableGroup(TF2DOwner):
         parent: TF2DOwner | None = None,
     ):
         super().__init__(x=x, y=y, theta=theta, parent=parent)
-        self.children: list[DrawableRect | DrawableGroup] = []
+        self.children: list[DrawableRect | DrawableLineStrip | DrawableGroup] = []
         self.visible = visible
 
-    def add(self, drawable: DrawableRect | DrawableGroup):
+    def add(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
         """Adds a child drawable to this group and binds this group as its parent."""
         if drawable not in self.children:
             self.children.append(drawable)
-            drawable.parent = self
+            if drawable.parent is None:
+                drawable.parent = self
 
-    def remove(self, drawable: DrawableRect | DrawableGroup):
+    def remove(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
         """Removes a child drawable from this group."""
         if drawable in self.children:
             self.children.remove(drawable)
@@ -393,18 +500,37 @@ class DrawableGroup(TF2DOwner):
                 child.parent = None
         self.children.clear()
 
-    def get_all_rects(self) -> list[DrawableRect]:
-        """Recursively collects all visible DrawableRect leaves in this group."""
+    def get_all_drawables(self) -> list[DrawableRect | DrawableLineStrip]:
+        """
+        Recursively collects all visible leaf drawables in this group
+        using breadth-first traversal (BFS).
+        The order of children in this group defines their draw order.
+        """
         if not self.visible:
             return []
-        rects: list[DrawableRect] = []
-        for child in self.children:
-            if isinstance(child, DrawableRect):
-                if child.visible:
-                    rects.append(child)
-            elif isinstance(child, DrawableGroup):
-                rects.extend(child.get_all_rects())
-        return rects
+        drawables: list[DrawableRect | DrawableLineStrip] = []
+        queue = deque(self.children)
+        visited = set()
+        while queue:
+            child = queue.popleft()
+            if id(child) in visited or not getattr(child, 'visible', True):
+                continue
+            visited.add(id(child))
+            if isinstance(child, DrawableGroup):
+                for subchild in child.children:
+                    if getattr(subchild, 'visible', True):
+                        queue.append(subchild)
+            elif isinstance(child, (DrawableRect, DrawableLineStrip)):
+                drawables.append(child)
+        return drawables
+
+    def get_all_rects(self) -> list[DrawableRect]:
+        """Recursively collects all visible DrawableRect leaves in this group in BFS order."""
+        return [d for d in self.get_all_drawables() if isinstance(d, DrawableRect)]
+
+    def get_all_line_strips(self) -> list[DrawableLineStrip]:
+        """Recursively collects all visible DrawableLineStrip leaves in this group in BFS order."""
+        return [d for d in self.get_all_drawables() if isinstance(d, DrawableLineStrip)]
 
     def __iter__(self):
         return iter(self.children)
@@ -566,15 +692,15 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
         self.border_color = (0.5, 0.5, 0.5, 1.0)
 
         # Collection of overlay drawables
-        self.drawables: list[DrawableRect | DrawableGroup] = []
+        self.drawables: list[DrawableRect | DrawableLineStrip | DrawableGroup] = []
         self._in_display = False
 
-    def add_drawable(self, drawable: DrawableRect | DrawableGroup):
+    def add_drawable(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
         """Adds a drawable shape or group to the overlay collection."""
         if drawable not in self.drawables:
             self.drawables.append(drawable)
 
-    def remove_drawable(self, drawable: DrawableRect | DrawableGroup):
+    def remove_drawable(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
         """Removes a drawable shape or group from the overlay collection."""
         if drawable in self.drawables:
             self.drawables.remove(drawable)
@@ -764,18 +890,25 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
         GL.glDisableVertexAttribArray(loc)
 
         # -------------------------------------------------------------
-        # PASS 2: Render transformed overlay shapes (DrawableRects)
+        # PASS 2: Render transformed overlay shapes in breadth-first order
         # -------------------------------------------------------------
         if self.drawables and self.shape_prog is not None:
-            rects: list[DrawableRect] = []
-            for item in self.drawables:
-                if isinstance(item, DrawableRect):
-                    if item.visible:
-                        rects.append(item)
-                elif isinstance(item, DrawableGroup):
-                    rects.extend(item.get_all_rects())
+            draw_items: list[DrawableRect | DrawableLineStrip] = []
+            queue = deque(self.drawables)
+            visited = set()
+            while queue:
+                item = queue.popleft()
+                if id(item) in visited or not getattr(item, 'visible', True):
+                    continue
+                visited.add(id(item))
+                if isinstance(item, DrawableGroup):
+                    for child in item.children:
+                        if getattr(child, 'visible', True):
+                            queue.append(child)
+                elif isinstance(item, (DrawableRect, DrawableLineStrip)):
+                    draw_items.append(item)
 
-            if rects:
+            if draw_items:
                 GL.glEnable(GL.GL_BLEND)
                 GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
                 GL.glUseProgram(self.shape_prog)
@@ -785,39 +918,59 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                 GL.glEnableVertexAttribArray(loc_pos)
                 GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.shape_vbo)
 
-                for rect in rects:
-                    world_pts = rect.get_world_vertices()  # (2, 4) column vectors
-                    if rect.coordinate_frame == "grid":
-                        pixel_pts = self.grid_to_pixel(world_pts)  # (2, 4) column vectors
-                    else:
-                        pixel_pts = world_pts
-                    ndc_pts = self.pixel_to_ndc(pixel_pts)  # (2, 4) column vectors
+                for item in draw_items:
+                    if isinstance(item, DrawableRect):
+                        world_pts = item.get_world_vertices()  # (2, 4) column vectors
+                        if item.coordinate_frame == "grid":
+                            pixel_pts = self.grid_to_pixel(world_pts)  # (2, 4) column vectors
+                        else:
+                            pixel_pts = world_pts
+                        ndc_pts = self.pixel_to_ndc(pixel_pts)  # (2, 4) column vectors
 
-                    # Implementation detail: OpenGL buffer expects row vectors (4, 2)
-                    ndc_pts_row = ndc_pts.T
+                        # Implementation detail: OpenGL buffer expects row vectors (4, 2)
+                        ndc_pts_row = ndc_pts.T
 
-                    # Filled quad (2 triangles: 0-1-2 and 0-2-3)
-                    fill_rgba = parse_color_rgba(rect.fill_color)
-                    if fill_rgba[3] > 0.0:
-                        tri_verts = np.array([
-                            ndc_pts_row[0], ndc_pts_row[1], ndc_pts_row[2],
-                            ndc_pts_row[0], ndc_pts_row[2], ndc_pts_row[3],
-                        ], dtype=np.float32)
-                        GL.glUniform4f(loc_col, *fill_rgba)
-                        GL.glBufferData(GL.GL_ARRAY_BUFFER, tri_verts.nbytes, tri_verts, GL.GL_DYNAMIC_DRAW)
-                        GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
-                        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
-
-                    # Outline border (line loop: 0-1-2-3)
-                    if rect.border_color is not None and rect.border_width > 0.0:
-                        border_rgba = parse_color_rgba(rect.border_color)
-                        if border_rgba[3] > 0.0:
-                            line_verts = np.ascontiguousarray(ndc_pts_row, dtype=np.float32)
-                            GL.glLineWidth(max(1.0, float(rect.border_width)))
-                            GL.glUniform4f(loc_col, *border_rgba)
-                            GL.glBufferData(GL.GL_ARRAY_BUFFER, line_verts.nbytes, line_verts, GL.GL_DYNAMIC_DRAW)
+                        # Filled quad (2 triangles: 0-1-2 and 0-2-3)
+                        fill_rgba = parse_color_rgba(item.fill_color)
+                        if fill_rgba[3] > 0.0:
+                            tri_verts = np.array([
+                                ndc_pts_row[0], ndc_pts_row[1], ndc_pts_row[2],
+                                ndc_pts_row[0], ndc_pts_row[2], ndc_pts_row[3],
+                            ], dtype=np.float32)
+                            GL.glUniform4f(loc_col, *fill_rgba)
+                            GL.glBufferData(GL.GL_ARRAY_BUFFER, tri_verts.nbytes, tri_verts, GL.GL_DYNAMIC_DRAW)
                             GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
-                            GL.glDrawArrays(GL.GL_LINE_LOOP, 0, 4)
+                            GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
+
+                        # Outline border (line loop: 0-1-2-3)
+                        if item.border_color is not None and item.border_width > 0.0:
+                            border_rgba = parse_color_rgba(item.border_color)
+                            if border_rgba[3] > 0.0:
+                                line_verts = np.ascontiguousarray(ndc_pts_row, dtype=np.float32)
+                                GL.glLineWidth(max(1.0, float(item.border_width)))
+                                GL.glUniform4f(loc_col, *border_rgba)
+                                GL.glBufferData(GL.GL_ARRAY_BUFFER, line_verts.nbytes, line_verts, GL.GL_DYNAMIC_DRAW)
+                                GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+                                GL.glDrawArrays(GL.GL_LINE_LOOP, 0, 4)
+
+                    elif isinstance(item, DrawableLineStrip):
+                        world_pts = item.get_world_vertices()  # (2, N) column vectors
+                        if world_pts.shape[1] < 2:
+                            continue
+                        if item.coordinate_frame == "grid":
+                            pixel_pts = self.grid_to_pixel(world_pts)
+                        else:
+                            pixel_pts = world_pts
+                        ndc_pts = self.pixel_to_ndc(pixel_pts)  # (2, N)
+                        ndc_pts_row = np.ascontiguousarray(ndc_pts.T, dtype=np.float32)
+
+                        color_rgba = parse_color_rgba(item.color)
+                        if color_rgba[3] > 0.0:
+                            GL.glLineWidth(max(1.0, float(item.line_width)))
+                            GL.glUniform4f(loc_col, *color_rgba)
+                            GL.glBufferData(GL.GL_ARRAY_BUFFER, ndc_pts_row.nbytes, ndc_pts_row, GL.GL_DYNAMIC_DRAW)
+                            GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+                            GL.glDrawArrays(GL.GL_LINE_STRIP, 0, ndc_pts_row.shape[0])
 
                 GL.glDisableVertexAttribArray(loc_pos)
                 GL.glDisable(GL.GL_BLEND)
@@ -973,9 +1126,9 @@ def get_gradient(v: float) -> str:
     return f'#{int(min(255, 512 * v)):02x}{int(min(255, 512 - 512 * v)):02x}00'
 
 
-def get_hsv_gradient(hue_percent: float, saturation: float = 1.0, value: float = 1.0) -> str:
+def get_hsv_gradient(hue_percent: float, saturation: float = 1.0, value: float = 1.0, alpha = 1.0) -> str:
     rgb = colorsys.hsv_to_rgb((1 - hue_percent) * (120 / 360), saturation, value)
-    return f'#{int(rgb[0] * 255):02x}{int(rgb[1] * 255):02x}{int(rgb[2] * 255):02x}'
+    return f'#{int(rgb[0] * 255):02x}{int(rgb[1] * 255):02x}{int(rgb[2] * 255):02x}{int(alpha * 255):02x}'
 
 
 def convert_text_to_rgb(text: Any) -> tuple[int, int, int]:

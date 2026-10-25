@@ -48,7 +48,16 @@ class StateFrame:
 class MotionPrimitive: # motion primitive states should be applied in vehicle coordinates
     inputs: list[InputFrame]
     states: list[StateFrame] # states are relative to t=0, i.e. before motion was applied
-    dt: float= 1
+    dt: float = 1
+    line_strip: obs.DrawableLineStrip | None = None
+
+    def __post_init__(self):
+        if self.line_strip is None and self.states:
+            verts = np.array(
+                [[f.state.x for f in self.states], [f.state.y for f in self.states]],
+                dtype=np.float64
+            )
+            self.line_strip = obs.DrawableLineStrip(vertices=verts, color=(0.0, 1.0, 0.0, 1.0))
 
 class MPSearchNode(obs.TF2DOwner):
     def __init__(self, via: MotionPrimitive | None, x: float, y: float, theta: float, dt: float, body: obs.DrawableRect):
@@ -58,6 +67,7 @@ class MPSearchNode(obs.TF2DOwner):
         self._body = body.copy()
         self._body.set_pose(x, y, theta)
         self._body.parent = None
+        self.line_strip: obs.DrawableLineStrip | None = None
 
     def reverse_via(self):
         """
@@ -102,12 +112,24 @@ class Vehicle(obs.DrawableGroup, AStar):
 
         obs.DrawableGroup.__init__(self, x, y, theta, True, parent_canvas)
         self.body = obs.DrawableRect(width=length, height=width, fill_color = (0, 1, 0), parent = self)
+        self.forward = obs.DrawableLineStrip((length/2., 0), 0, 0, 0, color=(1.0, 0.1, 0.5), line_width=2.0, parent=self.body)
         self.add(self.body)
+        self.add(self.forward)
 
         self.state_shape = state_shape
         self.controls = controls
         self._generate_default_motion_primitives(self._get_default_u_disc())
         self.visited_cells = set() # coordinates of cells A* has visited to trim reachability lattice
+
+        self.canvas = parent_canvas if parent_canvas is not None else obs._active_widget
+        self.cost_values: dict[Any, float] = {}
+        self.heur_values: dict[Any, float] = {}
+        self.gradient_values: list[float] = []
+        self.value_cache: np.ndarray | None = None
+        self.collision_line_strips: list[obs.DrawableLineStrip] = []
+        self.search_nodes_with_strips: list[MPSearchNode] = []
+        self.optimal_path_line_strips: list[obs.DrawableLineStrip] = []
+        ui.checkbox_toggle_callback = self.update_visualization
 
         self.mp_queue = [] # MotionPrimitives to execute
         self.mp_frame = 0 # which frame in mp_queue[0] is active
@@ -235,6 +257,129 @@ class Vehicle(obs.DrawableGroup, AStar):
         pass
 
     """
+    UI and visualization methods
+    """
+
+    def get_gradient_color(self, value: float) -> str:
+        self.gradient_values.append(float(value))
+        if len(self.gradient_values) > 1:
+            self.value_cache = np.histogram_bin_edges(np.sort(self.gradient_values), 10)
+            normalized = np.searchsorted(self.value_cache, value) / self.value_cache.size
+        else:
+            normalized = 0.0
+        return obs.get_hsv_gradient(float(np.clip(normalized, 0.0, 1.0)), 1.0)
+
+    def _refresh_display(self):
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if canvas is not None and getattr(canvas, 'context_created', False) and canvas.winfo_ismapped():
+            canvas.display()
+            canvas.update()
+
+    def _draw_colliding_neighbor(self, node, mp: MotionPrimitive, mp_node: MPSearchNode):
+        """Draws colliding neighbor primitive line strip in semi-transparent gray."""
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if mp.line_strip is not None:
+            transformed_strip = mp.line_strip.copy()
+            transformed_strip.set_pose(node.x, node.y, node.theta)
+            transformed_strip.color = (0.5, 0.5, 0.5, 0.5)
+            transformed_strip.visible = ui.should_draw_collisions()
+            mp_node.line_strip = transformed_strip
+            self.collision_line_strips.append(transformed_strip)
+            if canvas is not None:
+                canvas.add_drawable(transformed_strip)
+
+    def _draw_valid_neighbor(self, node, mp: MotionPrimitive, mp_node: MPSearchNode):
+        """Draws validated neighbor primitive line strip and registers it for rendering."""
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if mp.line_strip is not None:
+            transformed_strip = mp.line_strip.copy()
+            transformed_strip.set_pose(node.x, node.y, node.theta)
+            transformed_strip.visible = ui.should_draw_path()
+            mp_node.line_strip = transformed_strip
+            self.search_nodes_with_strips.append(mp_node)
+            if canvas is not None:
+                canvas.add_drawable(transformed_strip)
+
+    def _update_heuristic_display(self, current, result: float):
+        """Updates the line strip color based on heuristic estimate."""
+        self.heur_values[current] = result
+        if ui.should_draw_heur():
+            cost = self.cost_values.get(current, 0.0) if ui.should_draw_cost() else 0.0
+            val = result + cost
+            if getattr(current, 'line_strip', None) is not None:
+                current.line_strip.color = self.get_gradient_color(val)
+
+    def _update_cost_display(self, n2_data, result: float):
+        """Updates the line strip color based on cost estimate."""
+        self.cost_values[n2_data] = result
+        if ui.should_draw_cost():
+            heur = self.heur_values.get(n2_data, 0.0) if ui.should_draw_heur() else 0.0
+            val = result + heur
+            if getattr(n2_data, 'line_strip', None) is not None:
+                n2_data.line_strip.color = self.get_gradient_color(val)
+
+    def update_visualization(self):
+        """Re-evaluates visibility and gradient colors when checkboxes are toggled or step_time_callback runs."""
+        show_collisions = ui.should_draw_collisions()
+        for strip in self.collision_line_strips:
+            strip.visible = show_collisions
+
+        show_path = ui.should_draw_path()
+        show_cost = ui.should_draw_cost()
+        show_heur = ui.should_draw_heur()
+
+        path_strips = set(self.optimal_path_line_strips)
+
+        active_vals = []
+        node_vals = {}
+        for node in self.search_nodes_with_strips:
+            c = self.cost_values.get(node, 0.0)
+            h = self.heur_values.get(node, 0.0)
+            if show_cost and show_heur:
+                v = c + h
+            elif show_cost:
+                v = c
+            elif show_heur:
+                v = h
+            else:
+                v = None
+            node_vals[node] = v
+            if v is not None:
+                active_vals.append(v)
+
+        edges = np.histogram_bin_edges(np.sort(active_vals), 10) if len(active_vals) > 1 else None
+
+        for node in self.search_nodes_with_strips:
+            strip = getattr(node, 'line_strip', None)
+            if strip is None:
+                continue
+            strip.visible = show_path
+            if not show_path:
+                continue
+
+            if strip in path_strips:
+                strip.color = '#00ff00'
+                strip.line_width = 3.0
+            else:
+                strip.line_width = 1.5
+                v = node_vals.get(node)
+                if v is not None and edges is not None and edges.size > 0:
+                    norm = np.searchsorted(edges, v) / edges.size
+                    strip.color = obs.get_hsv_gradient(float(np.clip(norm, 0.0, 1.0)), 1.0, alpha=0.5)
+                else:
+                    strip.color = (0.0, 1.0, 0.0, 0.8)
+
+        for strip in path_strips:
+            strip.visible = show_path
+            if show_path:
+                strip.color = '#00ff00'
+                strip.line_width = 3.0
+
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if canvas is not None and getattr(canvas, 'context_created', False):
+            canvas.display()
+
+    """
     AStar impl (nodes are MPSearchNode, goal is fastquadtree rect tuple)
     """
 
@@ -244,24 +389,46 @@ class Vehicle(obs.DrawableGroup, AStar):
             mp_dest = mp.states[-1].state
             mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
             mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
-            if (not mp_node.check_collision(obs.obs_quadtree)
-                and (int(mp_dest.x), int(mp_dest.y)) not in self.visited_cells):
+            world_coord = (int(mp_dest_world[0]), int(mp_dest_world[1]), int(mp_dest.theta/(np.pi/4)))
+
+            if mp_node.check_collision(obs.obs_quadtree):
+                self._draw_colliding_neighbor(node, mp, mp_node)
+                continue
+
+            if world_coord not in self.visited_cells:
                 result.append(mp_node)
-                self.visited_cells.add((int(mp_dest.x), int(mp_dest.y)))
+                self.visited_cells.add(world_coord)
+                self._draw_valid_neighbor(node, mp, mp_node)
         return result
 
     def heuristic_cost_estimate(self, current, goal) -> float:
         gx = (goal[0] + goal[2])/2.
         gy = (goal[1] + goal[3])/2.
-        return np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2)
+        result = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
+        self._update_heuristic_display(current, result)
+        return result
 
     def path_distance_between(self, n1, n2) -> float:
         if n2.data.x == n1.data.x and n2.data.y == n1.data.y and n2.data.theta == n1.data.theta:
             return math.inf
-        return n2.data.dt
+        result = float(n2.data.dt)
+        self._update_cost_display(n2.data, result)
+        return result
 
     def is_goal_reached(self, current: T, goal: T) -> bool:
         return goal[0] <= current.x <= goal[2] and goal[1] <= current.y <= goal[3]
+
+    def astar(self, start: T, goal: T, reversePath: bool = False):
+        path = super().astar(start, goal, reversePath)
+        if path is not None:
+            path_list = list(path)
+            self.optimal_path_line_strips = [
+                getattr(seg, 'line_strip', None)
+                for seg in path_list
+                if getattr(seg, 'line_strip', None) is not None
+            ]
+            return path_list
+        return None
 
 class Robot(Vehicle):
     def __init__(self, canvas = None):
@@ -382,6 +549,7 @@ if __name__ == '__main__':
             robot.body.fill_color = (1.0, 0, 0)
             ui._current_time_rate = 0
             print(f'robot crashed')
+        robot.update_visualization()
         _canvas.redraw()
 
     ui.step_time_callback = step_time_callback
@@ -396,11 +564,20 @@ if __name__ == '__main__':
         if path is None:
             print(f'No path found')
             return
+        path = list(path)
+        robot.optimal_path_line_strips = [
+            getattr(path_segment, 'line_strip', None)
+            for path_segment in path
+            if getattr(path_segment, 'line_strip', None) is not None
+        ]
         for path_segment in path:
             print(f'{counter}: {path_segment}')
             if path_segment.via:
                 robot.queue_motion(path_segment.via)
             counter += 1
+        robot.update_visualization()
+        if _canvas is not None and getattr(_canvas, 'context_created', False):
+            _canvas.display()
 
     _root_window.after(500, run_astar)
     _root_window.mainloop()
