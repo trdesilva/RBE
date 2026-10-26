@@ -6,6 +6,7 @@ from astar import AStar, T, SearchNode
 import numpy as np
 import scipy as sc
 import fastquadtree as qt
+import rsplan
 
 try:
     from valet import obstacle_field as obs
@@ -191,7 +192,6 @@ class Vehicle(obs.DrawableGroup, AStar):
         :return: None
         """
         self.motion_primitives = self.generate_motion_primitives(self._get_default_u_disc(), dt=dt, simplify=True)
-        print(self.motion_primitives)
 
     def generate_motion_primitives(self, u_disc: list[np.ndarray], dt = 1., simplify = True):
         # enumerate lowest, closest to 0, and highest inputs
@@ -218,28 +218,34 @@ class Vehicle(obs.DrawableGroup, AStar):
         return motion_primitives
 
     def queue_motion(self, mp: MotionPrimitive):
+        if len(self.mp_queue) == 0:
+            self.mp_tf = self.get_world_transform_matrix()
+            self.mp_frame = 0
+            self.mp_time = 0
         self.mp_queue.append(mp)
 
     def run_queued_motions(self, dt = 1.):
         if len(self.mp_queue) < 1 or dt <= 0:
             return
 
+        if self.mp_frame == 0 and self.mp_time == 0:
+            self.mp_tf = self.get_world_transform_matrix()
+
         # if time advances less than a frame, interpolate
         frame = self.mp_queue[0].states[self.mp_frame]
         last_frame = self.mp_queue[0].states[self.mp_frame - 1] if self.mp_frame > 0 \
             else StateFrame(VehicleState(0,0,0), 0)
+        start_th = np.arctan2(self.mp_tf[1, 0], self.mp_tf[0, 0])
         if self.mp_time + dt < frame.dt:
             self.mp_time += dt
             # MotionPrimitives record states in the initial coordinate frame, so transform based on where the motion
             # started rather than the current position
-            diff = self.mp_tf @ np.array(
-                [last_frame.state.x + (self.mp_time - last_frame.dt)*(frame.state.x - last_frame.state.x)
-                                       /(frame.dt - last_frame.dt),
-                 last_frame.state.y + (self.mp_time - last_frame.dt)*(frame.state.y - last_frame.state.y)
-                                       /(frame.dt - last_frame.dt),
-                 1])
-            self.set_pose(diff[0], diff[1])
-            self.rotate(frame.state.theta * dt / frame.dt)
+            interp_ratio = (self.mp_time - last_frame.dt) / (frame.dt - last_frame.dt)
+            ix = last_frame.state.x + interp_ratio * (frame.state.x - last_frame.state.x)
+            iy = last_frame.state.y + interp_ratio * (frame.state.y - last_frame.state.y)
+            itheta = last_frame.state.theta + interp_ratio * (frame.state.theta - last_frame.state.theta)
+            diff = self.mp_tf @ np.array([ix, iy, 1.0])
+            self.set_pose(diff[0], diff[1], start_th + itheta)
             return
 
         # time advances at least one frame, so skip to the next one
@@ -247,9 +253,8 @@ class Vehicle(obs.DrawableGroup, AStar):
         self.mp_time = frame.dt
         diff = self.mp_tf @ np.array([frame.state.x,
                                       frame.state.y,
-                                      1])
-        self.set_pose(diff[0], diff[1])
-        self.rotate(frame.state.theta * time_skipped / frame.dt)
+                                      1.0])
+        self.set_pose(diff[0], diff[1], start_th + frame.state.theta)
 
         self.mp_frame += 1
         if self.mp_frame >= len(self.mp_queue[0].states):
@@ -433,7 +438,8 @@ class Vehicle(obs.DrawableGroup, AStar):
             mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
             mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
             world_coord = (int(mp_dest_world[0]*self.visited_density)/self.visited_density,
-                           int(mp_dest_world[1]*self.visited_density)/self.visited_density)
+                           int(mp_dest_world[1]*self.visited_density)/self.visited_density,
+                           int(mp_dest.theta/(np.pi/32)))
 
             if mp_node.check_collision(obs.obs_quadtree):
                 self._draw_colliding_neighbor(node, mp, mp_node)
@@ -457,7 +463,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
         angle_to_goal = np.atan2(gy - current.y, gx - current.x)
         # prefer pointing at goal when far away and being parallel with goal when close
-        heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (abs(current.theta) % np.pi)
+        heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (np.sin(abs(current.theta)))
         result = dist_to_goal + heading_heur
         self._update_heuristic_display(current, result)
         return result
@@ -504,18 +510,40 @@ class Robot(Vehicle):
                                  result)
             self.motion_primitives.append(mp)
 
-class Car(Vehicle):
-    def __init__(self, wheelbase_length=2.8, canvas = None, render_period = 1):
+class _CarMeta(type(Vehicle)):
+    _cached_mps_by_dt = None
+
+    @property
+    def mps_by_dt(cls):
+        if cls._cached_mps_by_dt is None:
+            car_inst = cls(canvas=None)
+            cls._cached_mps_by_dt = car_inst.mps_by_dt
+        return cls._cached_mps_by_dt
+
+class Car(Vehicle, metaclass=_CarMeta):
+    def __init__(self, wheelbase_length=2.8, canvas = None, render_period = 1, turn_radius = None, parking_space = None, goal_region = None):
         Vehicle.__init__(self, length=meters_to_cells(5.2), width=meters_to_cells(1.8), controls=2, canvas=canvas, render_period=render_period)
         self.body.fill_color = (0, 0.7, 0)
         self.body.border_color = (0, 0, 0, 0.5)
         self.wheelbase_offset = meters_to_cells(wheelbase_length/2.)
+        self.y -= self.wheelbase_offset # adjust starting position to account for rear axle offset
         wheelbase_ratio = self.wheelbase_offset/meters_to_cells(5.2)
         self.body.origin = (0.5 - wheelbase_ratio, 0.5)
         self.forward.x = self.wheelbase_offset
+        self.mp_tf = self.get_world_transform_matrix()
+        self.parking_space = parking_space if parking_space is not None else (8.0, 11.0, 10.0, 12.0)
+        self.goal_region = goal_region if goal_region is not None else (8.0, 10.0, 10.0, 12.0)
+        self._cached_local_plan: list[MotionPrimitive] | None = None
+
+        if turn_radius is not None:
+            self.turn_radius = turn_radius
+        else:
+            u_disc = self._get_default_u_disc()
+            max_steer = float(np.max(np.abs(u_disc[1])))
+            wheelbase = meters_to_cells(wheelbase_length)
+            self.turn_radius = wheelbase * float(np.tan(max_steer))
 
         self.mps_by_dt = {1: self.generate_motion_primitives(self._get_default_u_disc(), 1, False),
-                          0.5: self.generate_motion_primitives(self._get_default_u_disc(), 0.5, False),
                           0.1: self.generate_motion_primitives(self._get_default_u_disc(), 0.1, False),
                           0.01: self.generate_motion_primitives(self._get_default_u_disc(), 0.01, False)}
 
@@ -531,10 +559,10 @@ class Car(Vehicle):
         new_collisions = 0
         for dt, mps in self.mps_by_dt.items():
             self.motion_primitives = mps
-            self.visited_density = max(min(int(2./dt) + 1, 10), 0)
+            self.visited_density = max(min(int(np.sqrt(0.5/dt)) + 4, 100), 0)
             result.extend(super().neighbors(node))
             new_collisions = node.collision_count - new_collisions
-            if new_collisions < 1:
+            if new_collisions < 1 and len(result) > 0:
                 break
 
         if len(result) > 0:
@@ -545,16 +573,27 @@ class Car(Vehicle):
             return result
         return []
 
-    def heuristic_cost_estimate(self, current, goal) -> float:
-        gx = (goal[0] + goal[2])/2. + (self.wheelbase_offset if np.cos(current.theta) < 0 else -self.wheelbase_offset)
-        gy = (goal[1] + goal[3])/2.
-        dist_to_goal = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
-        max_dist_to_goal = float(np.sqrt(gx ** 2 + gy ** 2))
-        xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
-        angle_to_goal = abs(np.atan2(gy - current.y, gx - current.x) - current.theta)
-        # prefer pointing at goal when far away and being parallel with goal when close
-        heading_heur = abs(np.sin(angle_to_goal)) + 2 * xy_progress * (abs(np.sin(current.theta)))
-        result = dist_to_goal**1.5 + 2*heading_heur
+    def heuristic_cost_estimate(self, current: MPSearchNode, goal: tuple[float, float, float, float]) -> float:
+        start_pose = (float(current.x), float(current.y), float(current.theta))
+        gx = (goal[0] + goal[2]) / 2.0
+        gy = (goal[1] + goal[3]) / 2.0
+        if (goal[2] - goal[0]) >= (goal[3] - goal[1]):
+            goal_poses = [
+                (gx - self.wheelbase_offset, gy, 0.0),
+                (gx + self.wheelbase_offset, gy, np.pi),
+            ]
+        else:
+            goal_poses = [
+                (gx, gy - self.wheelbase_offset, np.pi / 2.0),
+                (gx, gy + self.wheelbase_offset, -np.pi / 2.0),
+            ]
+
+        lengths = [
+            rsplan.path(start_pose, gp, self.turn_radius, 0.0, 0.5).total_length
+            for gp in goal_poses
+        ]
+
+        result = float(min(lengths)) ** 1.5
         self._update_heuristic_display(current, result)
         return result
 
@@ -564,6 +603,291 @@ class Car(Vehicle):
         result = float(n2.data.dt)*abs(n2.data.theta - n1.data.theta)/2 + float(n2.data.dt)
         self._update_cost_display(n2.data, result)
         return result
+
+    def is_goal_reached(self, current: MPSearchNode, goal: tuple[float, float, float, float]) -> bool:
+        """
+        Goal reached condition using Reeds-Shepp path validity.
+        Only runs the full Reeds-Shepp check if the current node is sufficiently close
+        to the goal already (such as inside the 2x2 goal region, or within a Euclidean distance
+        threshold of a goal pose). Returns True if an unobstructed Reeds-Shepp path to the
+        parking space is found.
+        """
+        parking_space = getattr(self, 'parking_space', None)
+        if parking_space is None:
+            parking_space = goal if (goal[3] - goal[1]) <= 1.5 else (goal[0], (goal[1] + goal[3]) / 2.0, goal[2], goal[3])
+
+        goal_region = getattr(self, 'goal_region', None)
+        if goal_region is None:
+            if (goal[3] - goal[1]) >= 1.9 and (goal[2] - goal[0]) >= 1.9:
+                goal_region = goal
+            else:
+                goal_region = (goal[0], max(0.0, goal[1] - 1.0), goal[2], goal[3])
+
+        cx = (parking_space[0] + parking_space[2]) / 2.0
+        cy = (parking_space[1] + parking_space[3]) / 2.0
+        dist = math.hypot(current.x - cx, current.y - cy)
+
+        is_close = (
+            current._body.is_bounded_by(goal_region)
+            or (goal_region[0] <= current.x <= goal_region[2] and goal_region[1] <= current.y <= goal_region[3])
+            or dist <= 2.0
+        )
+        if not is_close:
+            return False
+
+        # If the center of the rear axle is inside the parking space without any collisions,
+        # attempt the iterative multi-point parking maneuver
+        is_rear_axle_in_space = (
+            parking_space[0] <= current.x <= parking_space[2]
+            and parking_space[1] <= current.y <= parking_space[3]
+        )
+        if is_rear_axle_in_space and not current.check_collision(obs.obs_quadtree):
+            local_plan = self.iterative_local_planner(current, parking_space, obs_quadtree=obs.obs_quadtree)
+            if local_plan is not None:
+                self._cached_local_plan = local_plan
+                return True
+
+        local_plan = self.local_planner(current, parking_space, goal_region=None, obs_quadtree=obs.obs_quadtree)
+        if local_plan is not None:
+            self._cached_local_plan = local_plan
+            return True
+
+        return False
+
+    def reeds_shepp_to_primitives(
+        self, rs_path: rsplan.Path, start_pose: tuple[float, float, float], step_size: float = 0.05
+    ) -> list[tuple[MotionPrimitive, MPSearchNode]]:
+        """
+        Convert each segment of an rsplan Path into a MotionPrimitive and corresponding MPSearchNode.
+        :param rs_path: An rsplan.Path object.
+        :param start_pose: The world pose (x, y, theta) at the start of the path.
+        :param step_size: Discretization step size for segment waypoints.
+        :return: A list of (MotionPrimitive, MPSearchNode) tuples for each segment.
+        """
+        curr_x, curr_y, curr_theta = float(start_pose[0]), float(start_pose[1]), float(start_pose[2])
+        result = []
+        for seg in rs_path.segments:
+            wps = seg.calc_waypoints((0.0, 0.0, 0.0), step_size, False)
+            seg_len = abs(float(seg.length))
+            if len(wps) > 1:
+                num = len(wps) - 1
+                states = [
+                    StateFrame(VehicleState(float(pt[0]), float(pt[1]), float(pt[2])), dt=seg_len * (i / num))
+                    for i, pt in enumerate(wps[1:], 1)
+                ]
+            else:
+                states = [StateFrame(VehicleState(0.0, 0.0, 0.0), dt=seg_len)]
+
+            inputs = [InputFrame(np.array([float(seg.direction), float(seg._curvature())]), dt=seg_len)]
+            mp = MotionPrimitive(inputs=inputs, states=states, dt=seg_len)
+
+            last_pt = wps[-1] if len(wps) > 0 else (0.0, 0.0, 0.0)
+            c_th = np.cos(curr_theta)
+            s_th = np.sin(curr_theta)
+            next_x = curr_x + c_th * last_pt[0] - s_th * last_pt[1]
+            next_y = curr_y + s_th * last_pt[0] + c_th * last_pt[1]
+            next_theta = curr_theta + last_pt[2]
+
+            node = MPSearchNode(via=mp, x=next_x, y=next_y, theta=next_theta, dt=seg_len, body=self.body)
+            if mp.line_strip is not None:
+                strip = mp.line_strip.copy()
+                strip.set_pose(curr_x, curr_y, curr_theta)
+                node.line_strip = strip
+                mp.world_line_strip = strip
+
+            result.append((mp, node))
+            curr_x, curr_y, curr_theta = next_x, next_y, next_theta
+
+        return result
+
+    def iterative_local_planner(
+        self,
+        current: MPSearchNode | tuple[float, float, float],
+        parking_space: tuple[float, float, float, float],
+        obs_quadtree: qt.RectQuadTree | None = None,
+        step_size: float = 0.01,
+        max_iters: int = 50,
+    ) -> list[MotionPrimitive] | None:
+        """
+        Executes an iterative Reeds-Shepp multi-point parking maneuver by alternating
+        between forward and reverse at maximum steering, truncating each MotionPrimitive
+        at the frame immediately before collision with an obstacle.
+        With enough iterations, the Car's y-coordinate increases and x stays in clearance range
+        until the Car is completely bounded by the parking space.
+        """
+        if isinstance(current, MPSearchNode):
+            curr = (float(current.x), float(current.y), float(current.theta))
+        else:
+            curr = (float(current[0]), float(current[1]), float(current[2]))
+
+        if obs_quadtree is None:
+            obs_quadtree = obs.obs_quadtree
+
+        test_body = self.body.copy()
+        test_body.parent = None
+        test_body.set_pose(*curr)
+
+        # If already fully bounded by parking space without collision, zero motions needed
+        if test_body.is_bounded_by(parking_space) and not check_collision(test_body, obs_quadtree):
+            return []
+
+        # Maneuver is only possible once the center of the rear axle (Car origin)
+        # is inside the parking space without any collisions
+        if not (parking_space[0] <= curr[0] <= parking_space[2] and parking_space[1] <= curr[1] <= parking_space[3]):
+            return None
+        if check_collision(test_body, obs_quadtree):
+            return None
+
+        # Determine alignment and target coordinates based on space orientation
+        is_horizontal = (parking_space[2] - parking_space[0]) >= (parking_space[3] - parking_space[1])
+        if is_horizontal:
+            target_y = (parking_space[1] + parking_space[3]) / 2.0
+            target_fwd = (parking_space[2] + 2.0, target_y, 0.0)
+            target_rev = (parking_space[0] - 2.0, target_y, 0.0)
+        else:
+            target_x = (parking_space[0] + parking_space[2]) / 2.0
+            target_fwd = (target_x, parking_space[3] + 2.0, np.pi / 2.0)
+            target_rev = (target_x, parking_space[1] - 2.0, np.pi / 2.0)
+
+        direction = 1
+        executed_mps: list[MotionPrimitive] = []
+
+        for _ in range(max_iters):
+            test_body.set_pose(*curr)
+            if test_body.is_bounded_by(parking_space) and not check_collision(test_body, obs_quadtree):
+                return executed_mps
+
+            target = target_fwd if direction == 1 else target_rev
+            p = rsplan.path(curr, target, self.turn_radius, 0.0, step_size)
+            moved = False
+            for seg in p.segments:
+                if seg.direction != direction:
+                    break
+                wps = seg.calc_waypoints((0.0, 0.0, 0.0), step_size, False)
+                if len(wps) < 2:
+                    continue
+
+                c_th = np.cos(curr[2])
+                s_th = np.sin(curr[2])
+                last_valid = 0
+                for i in range(1, len(wps)):
+                    pt = wps[i]
+                    wx = curr[0] + c_th * pt[0] - s_th * pt[1]
+                    wy = curr[1] + s_th * pt[0] + c_th * pt[1]
+                    wth = curr[2] + pt[2]
+                    test_body.set_pose(wx, wy, wth)
+                    if check_collision(test_body, obs_quadtree):
+                        break
+                    last_valid = i
+
+                if last_valid > 0:
+                    truncated_wps = wps[:last_valid + 1]
+                    seg_len = abs(float(seg.length))
+                    num_wps = len(wps) - 1
+                    dt = seg_len * (last_valid / num_wps) if num_wps > 0 else seg_len
+                    states = [
+                        StateFrame(VehicleState(float(pt[0]), float(pt[1]), float(pt[2])), dt=seg_len * (i / num_wps))
+                        for i, pt in enumerate(truncated_wps[1:], 1)
+                    ]
+                    inputs = [InputFrame(np.array([float(seg.direction), float(seg._curvature())]), dt=dt)]
+                    mp = MotionPrimitive(inputs=inputs, states=states, dt=dt)
+                    if mp.line_strip is not None:
+                        strip = mp.line_strip.copy()
+                        strip.set_pose(curr[0], curr[1], curr[2])
+                        mp.world_line_strip = strip
+                    executed_mps.append(mp)
+
+                    pt = truncated_wps[-1]
+                    curr = (
+                        curr[0] + c_th * pt[0] - s_th * pt[1],
+                        curr[1] + s_th * pt[0] + c_th * pt[1],
+                        curr[2] + pt[2],
+                    )
+                    moved = True
+                    if last_valid < len(wps) - 1:
+                        # Encountered imminent obstacle collision and truncated
+                        break
+
+            direction = -direction
+
+        test_body.set_pose(*curr)
+        if test_body.is_bounded_by(parking_space) and not check_collision(test_body, obs_quadtree):
+            return executed_mps
+        return None
+
+    def local_planner(
+        self,
+        current: MPSearchNode | tuple[float, float, float],
+        parking_space: tuple[float, float, float, float],
+        goal_region: tuple[float, float, float, float] | None = None,
+        obs_quadtree: qt.RectQuadTree | None = None,
+        step_size: float = 0.01
+    ) -> list[MotionPrimitive] | None:
+        """
+        Executes a local planner using rsplan to find an unobstructed Reeds-Shepp path
+        from the current pose to the parking space.
+        :param current: Current MPSearchNode or (x, y, theta) pose.
+        :param parking_space: Target parking space bounding box (minx, miny, maxx, maxy).
+        :param goal_region: Expanded A* goal region (minx, miny, maxx, maxy) that current must be within.
+        :param obs_quadtree: Quadtree containing obstacles for collision checking.
+        :param step_size: Step size for Reeds-Shepp discretization.
+        :return: List of MotionPrimitives to reach the parking space, or None if outside goal_region or obstructed.
+        """
+        if isinstance(current, MPSearchNode):
+            start_pose = (float(current.x), float(current.y), float(current.theta))
+            node_body = current._body
+        else:
+            start_pose = (float(current[0]), float(current[1]), float(current[2]))
+            node_body = self.body.copy()
+            node_body.parent = None
+            node_body.set_pose(start_pose[0], start_pose[1], start_pose[2])
+
+        if goal_region is not None:
+            is_inside = node_body.is_bounded_by(goal_region) or (
+                goal_region[0] <= start_pose[0] <= goal_region[2]
+                and goal_region[1] <= start_pose[1] <= goal_region[3]
+            )
+            if not is_inside:
+                return None
+
+        cx = (parking_space[0] + parking_space[2]) / 2.0
+        cy = (parking_space[1] + parking_space[3]) / 2.0
+        if (parking_space[2] - parking_space[0]) >= (parking_space[3] - parking_space[1]):
+            goal_poses = [
+                (cx - self.wheelbase_offset, cy, 0.0),
+                (cx + self.wheelbase_offset, cy, np.pi),
+            ]
+        else:
+            goal_poses = [
+                (cx, cy - self.wheelbase_offset, np.pi / 2.0),
+                (cx, cy + self.wheelbase_offset, -np.pi / 2.0),
+            ]
+
+        if obs_quadtree is None:
+            obs_quadtree = obs.obs_quadtree
+
+        candidates = [
+            rsplan.path(start_pose, gp, self.turn_radius, 0.0, step_size)
+            for gp in goal_poses
+        ]
+        candidates.sort(key=lambda p: p.total_length)
+
+        for p in candidates:
+            pairs = self.reeds_shepp_to_primitives(p, start_pose, step_size=step_size)
+            collided = False
+            for mp, node in pairs:
+                if obs_quadtree is not None and node.check_collision(obs_quadtree):
+                    collided = True
+                    break
+            if not collided:
+                return [mp for mp, _ in pairs]
+
+        # If single-shot path is obstructed, attempt iterative multi-point parking maneuver
+        iterative_plan = self.iterative_local_planner(current, parking_space, obs_quadtree=obs_quadtree, step_size=step_size)
+        if iterative_plan is not None:
+            return iterative_plan
+
+        return None
 
 def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
     body_verts = body.get_world_vertices()
@@ -636,7 +960,7 @@ if __name__ == '__main__':
     obs._cell_height = 25
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
-    obs.populate_cells(0.0, True, _canvas)
+    obs.populate_cells(0.1, True, _canvas)
 
     # start and parking spots
     obs.clear_cell(0, 0)
@@ -644,8 +968,8 @@ if __name__ == '__main__':
 
     obs.clear_cell(8, 11)
     obs.clear_cell(9, 11)
-    #obs.add_to_cell(6, 11, 1)
-    #obs.add_to_cell(7, 11, 1)
+    obs.add_to_cell(6, 11, 1)
+    obs.add_to_cell(7, 11, 1)
     obs.add_to_cell(10, 11, 1)
     obs.add_to_cell(11, 11, 1)
 
@@ -676,7 +1000,11 @@ if __name__ == '__main__':
 
     def run_astar():
         print(f'running A* from {robot.x, robot.y, robot.theta}')
-        path = robot.astar(MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body), (8, 11, 10, 12))
+        parking_space = (8.0, 11.0, 10.0, 12.0)
+        # 2x2 expanded goal region covering the parking space and adjacent driving aisle
+        astar_goal_region = (8.0, 10.0, 10.0, 12.0)
+        start_node = MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body)
+        path = robot.astar(start_node, astar_goal_region)
         counter = 0
         if path is None:
             print(f'No path found')
@@ -692,6 +1020,24 @@ if __name__ == '__main__':
             if path_segment.via:
                 robot.queue_motion(path_segment.via)
             counter += 1
+
+        end_node = path[-1] if len(path) > 0 else start_node
+        local_mps = getattr(robot, '_cached_local_plan', None)
+        if local_mps is None:
+            local_mps = robot.local_planner(end_node, parking_space, None, obs.obs_quadtree)
+        if local_mps is not None:
+            for mp in local_mps:
+                print(f'{counter} (local): {mp}')
+                robot.queue_motion(mp)
+                strip = getattr(mp, 'world_line_strip', None)
+                if strip is not None:
+                    robot.optimal_path_line_strips.append(strip)
+                    if _canvas is not None:
+                        _canvas.add_drawable(strip)
+                counter += 1
+        else:
+            print('No collision-free Reeds-Shepp path found by local planner')
+
         robot.update_visualization()
         if _canvas is not None and getattr(_canvas, 'context_created', False):
             _canvas.display()
