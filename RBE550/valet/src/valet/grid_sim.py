@@ -178,7 +178,7 @@ def populate_motion_primitives(mps_by_dt=None):
                     from .planner import Car
                 except ImportError:
                     from planner import Car
-            mps_by_dt = Car.mps_by_dt
+            mps_by_dt = {}
 
     for dt, mps in mps_by_dt.items():
         for i, mp in enumerate(mps):

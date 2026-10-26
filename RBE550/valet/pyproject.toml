@@ -17,6 +17,7 @@ dependencies = [
     "pyopengltk>=0.0.4",
     "scipy>=1.18.1",
     "scipy-stubs~=1.18.1",
+    "rsplan"
 ]
 
 [project.scripts]

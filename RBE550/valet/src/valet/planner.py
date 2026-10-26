@@ -68,6 +68,7 @@ class MPSearchNode(obs.TF2DOwner):
         self._body.set_pose(x, y, theta)
         self._body.parent = None
         self.line_strip: obs.DrawableLineStrip | None = None
+        self.collision_count = 0
 
     def reverse_via(self):
         """
@@ -83,14 +84,18 @@ class MPSearchNode(obs.TF2DOwner):
         if self.via is None:
             return check_collision(self._body, obs_quadtree)
         if 0 <= self.x <= obs.FIELD_WIDTH and 0 <= self.y <= obs.FIELD_HEIGHT:
-            self.reverse_via()
-            start_tf = self._body.get_world_transform_matrix()
-            for frame in self.via.states:
-                new_pose = start_tf @ np.array((frame.state.x, frame.state.y, 1))
-                self._body.set_pose(new_pose[0], new_pose[1], self._body.theta + frame.state.theta)
-                if check_collision(self._body, obs_quadtree):
-                    return True
-            return False
+            try:
+                self.reverse_via()
+                start_theta = self._body.theta
+                start_tf = self._body.get_world_transform_matrix()
+                for frame in self.via.states:
+                    new_pose = start_tf @ np.array((frame.state.x, frame.state.y, 1))
+                    self._body.set_pose(new_pose[0], new_pose[1], start_theta + frame.state.theta)
+                    if check_collision(self._body, obs_quadtree):
+                        return True
+                return False
+            finally:
+                self._body.set_pose(self.x, self.y, self.theta)
         else:
             return True # off the map collides with edge of grid
 
@@ -119,7 +124,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         self.state_shape = state_shape
         self.controls = controls
         self._generate_default_motion_primitives(self._get_default_u_disc())
-        self.visited_cells = set() # coordinates of cells A* has visited to trim reachability lattice
+        self.visited_cells = {0: set()} # coordinates of cells A* has visited to trim reachability lattice
         self.visited_density = visited_density # linear density of visited_cells relative to grid
         self.render_period = render_period
         self._neighbor_count = 0
@@ -428,16 +433,19 @@ class Vehicle(obs.DrawableGroup, AStar):
             mp_dest_world = node.get_world_transform_matrix() @ np.array((mp_dest.x, mp_dest.y, 1))
             mp_node = MPSearchNode(mp, mp_dest_world[0], mp_dest_world[1], node.theta + mp_dest.theta, mp.dt, node._body)
             world_coord = (int(mp_dest_world[0]*self.visited_density)/self.visited_density,
-                           int(mp_dest_world[1]*self.visited_density)/self.visited_density,
-                           int(mp_dest.theta/(np.pi/4)))
+                           int(mp_dest_world[1]*self.visited_density)/self.visited_density)
 
             if mp_node.check_collision(obs.obs_quadtree):
                 self._draw_colliding_neighbor(node, mp, mp_node)
+                node.collision_count += 1
                 continue
 
-            if world_coord not in self.visited_cells:
+            if not self.visited_density in self.visited_cells.keys():
+                self.visited_cells[self.visited_density] = set()
+
+            if world_coord not in self.visited_cells[self.visited_density]:
                 result.append(mp_node)
-                self.visited_cells.add(world_coord)
+                self.visited_cells[self.visited_density].add(world_coord)
                 self._draw_valid_neighbor(node, mp, mp_node)
         return result
 
@@ -447,7 +455,7 @@ class Vehicle(obs.DrawableGroup, AStar):
         dist_to_goal = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
         max_dist_to_goal = float(np.sqrt(gx ** 2 + gy ** 2))
         xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
-        angle_to_goal = np.atan2(gx - current.x, gy - current.y)
+        angle_to_goal = np.atan2(gy - current.y, gx - current.x)
         # prefer pointing at goal when far away and being parallel with goal when close
         heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (abs(current.theta) % np.pi)
         result = dist_to_goal + heading_heur
@@ -496,27 +504,17 @@ class Robot(Vehicle):
                                  result)
             self.motion_primitives.append(mp)
 
-class _CarMeta(type(Vehicle)):
-    _cached_mps_by_dt = None
-
-    @property
-    def mps_by_dt(cls):
-        if cls._cached_mps_by_dt is None:
-            car_inst = cls(canvas=None)
-            cls._cached_mps_by_dt = car_inst.mps_by_dt
-        return cls._cached_mps_by_dt
-
-class Car(Vehicle, metaclass=_CarMeta):
+class Car(Vehicle):
     def __init__(self, wheelbase_length=2.8, canvas = None, render_period = 1):
         Vehicle.__init__(self, length=meters_to_cells(5.2), width=meters_to_cells(1.8), controls=2, canvas=canvas, render_period=render_period)
         self.body.fill_color = (0, 0.7, 0)
         self.body.border_color = (0, 0, 0, 0.5)
-        wheelbase_ratio = meters_to_cells(wheelbase_length/2.)/meters_to_cells(5.2)
+        self.wheelbase_offset = meters_to_cells(wheelbase_length/2.)
+        wheelbase_ratio = self.wheelbase_offset/meters_to_cells(5.2)
         self.body.origin = (0.5 - wheelbase_ratio, 0.5)
-        self.forward.x = meters_to_cells(wheelbase_length/2.)
+        self.forward.x = self.wheelbase_offset
 
-        self.mps_by_dt = {1.5: self.generate_motion_primitives(self._get_default_u_disc(), 1.5, False),
-                          1: self.generate_motion_primitives(self._get_default_u_disc(), 1, False),
+        self.mps_by_dt = {1: self.generate_motion_primitives(self._get_default_u_disc(), 1, False),
                           0.5: self.generate_motion_primitives(self._get_default_u_disc(), 0.5, False),
                           0.1: self.generate_motion_primitives(self._get_default_u_disc(), 0.1, False),
                           0.01: self.generate_motion_primitives(self._get_default_u_disc(), 0.01, False)}
@@ -528,42 +526,43 @@ class Car(Vehicle, metaclass=_CarMeta):
         return [np.array([-1, 1]),
                 np.linspace(-np.pi/4, np.pi/4, 3)]
 
-    def neighbors(self, node: T) -> Iterable[T]:
-        body_verts = node._body.get_world_vertices()
-        def get_nearest_cell_center(v):
-            nn = obs.obs_quadtree.nearest_neighbor_np((v[0], v[1]))
-            if nn is None or nn[1] is None:
-                return np.array([float('inf'), float('inf')])
-            return np.apply_along_axis(np.average, # take the average...
-                                       1, # ... along rows...
-                                       nn[1].reshape(2,2).T) # ... of min and max points as column vectors
-        nearest_cells = np.apply_along_axis(get_nearest_cell_center, 0, body_verts)
-        nearest_dist = np.min(np.linalg.norm(nearest_cells - body_verts, axis=1))\
-        
-        self.motion_primitives.clear()
+    def neighbors(self, node: MPSearchNode) -> Iterable[MPSearchNode]:
+        result = []
+        new_collisions = 0
         for dt, mps in self.mps_by_dt.items():
-            if nearest_dist >= dt:
-                self.motion_primitives.extend(mps)
-                result = super().neighbors(node)
-                if len(result) > 0:
-                    self._neighbor_count += len(result)
-                    if self.render_period > 0 and self._neighbor_count >= self.render_period:
-                        self._neighbor_count = 0
-                        self._refresh_display()
-                    return result
+            self.motion_primitives = mps
+            self.visited_density = max(min(int(2./dt) + 1, 10), 0)
+            result.extend(super().neighbors(node))
+            new_collisions = node.collision_count - new_collisions
+            if new_collisions < 1:
+                break
+
+        if len(result) > 0:
+            self._neighbor_count += len(result)
+            if self.render_period > 0 and self._neighbor_count >= self.render_period:
+                self._neighbor_count = 0
+                self._refresh_display()
+            return result
         return []
 
     def heuristic_cost_estimate(self, current, goal) -> float:
-        gx = (goal[0] + goal[2])/2.
+        gx = (goal[0] + goal[2])/2. + (self.wheelbase_offset if np.cos(current.theta) < 0 else -self.wheelbase_offset)
         gy = (goal[1] + goal[3])/2.
         dist_to_goal = float(np.sqrt((gx - current.x) ** 2 + (gy - current.y) ** 2))
         max_dist_to_goal = float(np.sqrt(gx ** 2 + gy ** 2))
         xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
-        angle_to_goal = np.atan2(gx - current.x, gy - current.y)
+        angle_to_goal = abs(np.atan2(gy - current.y, gx - current.x) - current.theta)
         # prefer pointing at goal when far away and being parallel with goal when close
-        heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (abs(current.theta) % np.pi)
-        result = dist_to_goal + heading_heur
+        heading_heur = abs(np.sin(angle_to_goal)) + 2 * xy_progress * (abs(np.sin(current.theta)))
+        result = dist_to_goal**1.5 + 2*heading_heur
         self._update_heuristic_display(current, result)
+        return result
+
+    def path_distance_between(self, n1, n2) -> float:
+        if n2.data.x == n1.data.x and n2.data.y == n1.data.y and n2.data.theta == n1.data.theta:
+            return math.inf
+        result = float(n2.data.dt)*abs(n2.data.theta - n1.data.theta)/2 + float(n2.data.dt)
+        self._update_cost_display(n2.data, result)
         return result
 
 def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
@@ -645,8 +644,8 @@ if __name__ == '__main__':
 
     obs.clear_cell(8, 11)
     obs.clear_cell(9, 11)
-    obs.add_to_cell(6, 11, 1)
-    obs.add_to_cell(7, 11, 1)
+    #obs.add_to_cell(6, 11, 1)
+    #obs.add_to_cell(7, 11, 1)
     obs.add_to_cell(10, 11, 1)
     obs.add_to_cell(11, 11, 1)
 

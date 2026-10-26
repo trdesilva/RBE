@@ -169,6 +169,15 @@ wheels = [
 ]
 
 [[package]]
+name = "rsplan"
+version = "1.0.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/be/d6/824a43a939afba7ac03cacc9d687a9d93736d5a52be2f8c07b77d891d1ea/rsplan-1.0.10.tar.gz", hash = "sha256:07c7202cc0d638f080d164563f9cec3c5d7c5159c43b24c340c40b53c29ebb91", size = 17631, upload-time = "2023-08-31T13:39:38.248Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/44/958c338824aae30b60a4f99bacf51d0d4ad01266e630e2403e06b2351af4/rsplan-1.0.10-py3-none-any.whl", hash = "sha256:31921e71883bc48aefd41c2aa0b414ca9d04f590f20de62f55d050b5da4d741c", size = 18463, upload-time = "2023-08-31T13:39:36.948Z" },
+]
+
+[[package]]
 name = "scipy"
 version = "1.18.1"
 source = { registry = "https://pypi.org/simple" }
@@ -253,6 +262,7 @@ dependencies = [
     { name = "pyopengl" },
     { name = "pyopengl-accelerate" },
     { name = "pyopengltk" },
+    { name = "rsplan" },
     { name = "scipy" },
     { name = "scipy-stubs" },
 ]
@@ -266,6 +276,7 @@ requires-dist = [
     { name = "pyopengl", specifier = ">=3.1.10" },
     { name = "pyopengl-accelerate", specifier = ">=3.1.10" },
     { name = "pyopengltk", specifier = ">=0.0.4" },
+    { name = "rsplan" },
     { name = "scipy", specifier = ">=1.18.1" },
     { name = "scipy-stubs", specifier = "~=1.18.1" },
 ]

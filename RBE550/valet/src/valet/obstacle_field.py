@@ -278,6 +278,7 @@ class TF2DOwner:
     def _mark_dirty(self):
         self._dirty_transform = True
         self._cached_world_matrix = None
+        self._cached_world_pose = None
 
     @property
     def degrees(self) -> float:
@@ -305,6 +306,13 @@ class TF2DOwner:
                 changed = True
         if changed:
             self._mark_dirty()
+
+    def get_world_pose(self):
+        if self._dirty_transform or self._cached_world_pose is None:
+            pose_arr = self.get_world_transform_matrix() @ np.array((self.x, self.y, 1))
+            self._cached_world_pose = (pose_arr[0], pose_arr[1], self.theta)
+        return self._cached_world_pose
+
 
     def translate(self, dx: float, dy: float):
         """Translates the transform by (dx, dy)."""
@@ -506,7 +514,7 @@ class DrawableRect(TF2DOwner):
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 
     def is_bounded_by(self, qt_rect):
-        for v in self.get_world_vertices():
+        for v in self.get_world_vertices().swapaxes(1, 0):
             if not(qt_rect[0] <= v[0] <= qt_rect[2] and qt_rect[1] <= v[1] <= qt_rect[3]):
                 return False
         return True
