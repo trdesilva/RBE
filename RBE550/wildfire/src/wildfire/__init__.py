@@ -3,10 +3,11 @@ import valet.grid_sim as ui
 import valet.planner as plan
 
 def main() -> None:
-    obs.FIELD_HEIGHT = 12
-    obs.FIELD_WIDTH = 12
-    obs._cell_width = 25
-    obs._cell_height = 25
+    obs.FIELD_HEIGHT = 25
+    obs.FIELD_WIDTH = 25
+    obs._cell_width = 20
+    obs._cell_height = 20
+    ui.METERS_PER_CELL = 5.
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
     obs.populate_cells(0.1, True, _canvas)

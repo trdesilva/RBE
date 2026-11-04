@@ -37,6 +37,13 @@ _mp_map = {}
 _mp_combobox = None
 _mp_var = None
 
+METERS_PER_CELL = 1.
+
+def meters_to_cells(meters):
+    return meters/METERS_PER_CELL
+
+def cells_to_meters(cells):
+    return cells*METERS_PER_CELL
 
 def should_draw_path() -> bool:
     if isinstance(_should_draw_path, tk.BooleanVar):
