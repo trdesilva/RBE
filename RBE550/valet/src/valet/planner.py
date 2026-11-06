@@ -501,6 +501,10 @@ class Robot(Vehicle):
     def _make_controls(self, u, s0):
         return lambda t, s: np.array([u[0]*np.cos(s[2]), u[0]*np.sin(s[2]), u[1]])
 
+    def _get_default_u_disc(self):
+        return [np.array([-1, 0, 1]),
+                np.linspace(-np.pi/4, np.pi/4, 5)]
+
     def generate_special_motion_primitives(self):
         u_disc = self._get_default_u_disc()
         input_perms = _permute_vectors([u_disc[0], np.array([u_disc[1][1], u_disc[1][2]])])
@@ -977,7 +981,7 @@ if __name__ == '__main__':
     _canvas.add_drawable(goal_rect)
 
     #car = Vehicle(meters_to_cells(5.2), meters_to_cells(1.8))
-    robot = Car()
+    robot = Robot()
     _canvas.add_drawable(robot)
 
     def step_time_callback():
@@ -1004,7 +1008,7 @@ if __name__ == '__main__':
         # 2x2 expanded goal region covering the parking space and adjacent driving aisle
         astar_goal_region = (8.0, 10.0, 10.0, 12.0)
         start_node = MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body)
-        path = robot.astar(start_node, astar_goal_region)
+        path = robot.astar(start_node, parking_space)
         counter = 0
         if path is None:
             print(f'No path found')
@@ -1023,7 +1027,7 @@ if __name__ == '__main__':
 
         end_node = path[-1] if len(path) > 0 else start_node
         local_mps = getattr(robot, '_cached_local_plan', None)
-        if local_mps is None:
+        if local_mps is None and hasattr(robot, 'local_planner'):
             local_mps = robot.local_planner(end_node, parking_space, None, obs.obs_quadtree)
         if local_mps is not None:
             for mp in local_mps:
