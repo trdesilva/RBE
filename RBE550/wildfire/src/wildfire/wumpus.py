@@ -75,6 +75,7 @@ class Wumpus(obs.DrawableGroup, AStar):
                 int(world_coords[1]) == round(nearest_obstacle[2])):
                     return True
         return False
+
     """
     A* Impl
     """

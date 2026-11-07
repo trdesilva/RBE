@@ -13,6 +13,7 @@ OBS_EXT = 3
 OBS_BURNED = 4
 
 obstacle_states = [[], [], [], []]
+cell_to_obstacle = {}
 
 def main() -> None:
     obs.FIELD_HEIGHT = 25
@@ -24,6 +25,11 @@ def main() -> None:
     obs.draw_grid()
     obstacles = obs.populate_cells(0.1, True, _canvas)
     obstacle_states[OBS_INTACT].extend(obstacles.keys())
+    # map cells back to obstacles for lookup when burning
+    for (coord, subgrid) in obstacles:
+        for i in np.ndindex(subgrid.shape):
+            if subgrid[i] == 1:
+                cell_to_obstacle[coord[0] + i[0], coord[1] + i[1]] = coord
 
     # start and parking spots
     obs.clear_cell(0, 0)
