@@ -192,7 +192,9 @@ class Firetruck(obs.DrawableGroup):
         length: float = 4.9,
         width: float = 2.2,
         wheelbase: float = 3.0,
-        turn_radius: Optional[float] = None
+        turn_radius: Optional[float] = None,
+        speed: float = 10,
+        obs_quadtree: qt.RectQuadTree|None = None
     ):
         super().__init__(x, y, theta)
 
@@ -219,10 +221,14 @@ class Firetruck(obs.DrawableGroup):
         self.turn_radius = (
             ui.meters_to_cells(turn_radius) if turn_radius is not None else self.wheelbase_cells * 1.5
         )
+        self.speed = ui.meters_to_cells(speed)
+
+        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 25*25, 5, 5)
 
         # Motion execution queue
+        self._segment_queue = []
         self._waypoint_queue: List[rsplan.primitives.Waypoint] = []
-        self._queue_idx: int = 0
+        self._step_dist = 0
 
     def check_collision(self, obs_quadtree: qt.RectQuadTree) -> bool:
         """Tests whether the current body pose collides with the obstacle field."""
@@ -230,21 +236,28 @@ class Firetruck(obs.DrawableGroup):
 
     def queue_paths(self, paths: List[rsplan.primitives.Path]) -> None:
         """Enqueues waypoints from a sequence of rsplan Paths for navigation."""
-        self._waypoint_queue.clear()
-        self._queue_idx = 0
-        for p in paths:
-            self._waypoint_queue.extend(p.waypoints())
+        pass
 
-    def step(self, dt: float, speed_cells_per_sec: float = ui.meters_to_cells(10)) -> None:
+    def step(self, dt: float) -> None:
         """
         Advances the vehicle pose along the queued Reeds-Shepp waypoints.
         Moves only the body rectangle as it navigates.
+        Pseudo-Python implementation:
+        distance_to_cover = dt * self.speed
+        distance_per_waypoint = segment.length/len(self._waypoint_queue)
+        while distance_to_cover > distance_per_waypoint:
+            distance_to_cover -= distance_per_waypoint
+            self._step_dist += distance_per_waypoint
+            if self._step_dist > segment.length:
+                self._step_dist -= segment.length
+                segment = get_next_segment_and_pop_queue()
+                self._waypoint_queue = segment.waypoints
+                distance_per_waypoint = segment.length/len(self._waypoint_queue)
+            segment_progress = self._step_dist/segment.length
+            self.set_pose(self._waypoint_queue[segment_progress*len(self._waypoint_queue)])
+        self._step_dist += distance_to_cover
+        segment_progress = self._step_dist/segment.length
+        waypoint_progress = (self._step_dist % distance_per_waypoint)/distance_per_waypoint
+        self.set_pose(linear_interpolate_between_waypoints(segment_progress, waypoint_progress))
         """
-        if not self._waypoint_queue or self._queue_idx >= len(self._waypoint_queue):
-            return
-
-        # Advance waypoints proportionally to dt * speed
-        advance_steps = max(1, int(speed_cells_per_sec * dt * 10))
-        self._queue_idx = min(self._queue_idx + advance_steps, len(self._waypoint_queue) - 1)
-        target_wp = self._waypoint_queue[self._queue_idx]
-        self.set_pose(target_wp.x, target_wp.y, target_wp.yaw)
+        pass

@@ -35,7 +35,7 @@ def main() -> None:
     obs.clear_cell(0, 0)
     obs.clear_cell(0, 1)
 
-    truck = Firetruck(0.5, 1, np.pi/2, turn_radius=13)
+    truck = Firetruck(0.5, 1, np.pi/2, turn_radius=13, obs_quadtree=obs.obs_quadtree)
     wump = Wumpus(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1, obs.FIELD_WIDTH, obs.FIELD_HEIGHT, obs.obs_quadtree)
     _canvas.add_drawable(truck)
     _canvas.add_drawable(wump)
@@ -60,7 +60,7 @@ def main() -> None:
     _frame.pack()
 
     def run_planning():
-        print(f'not implemented')
+        truck.prm.generate_roadmap()
 
     ui.run_planning_callback = run_planning
     _root_window.mainloop()
