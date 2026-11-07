@@ -200,20 +200,24 @@ class Firetruck(obs.DrawableGroup):
         self.width_cells = ui.meters_to_cells(width)
         self.wheelbase_cells = ui.meters_to_cells(wheelbase)
         self.wheelbase_offset = self.wheelbase_cells / 2.0
+        self.y -= self.wheelbase_offset
 
         # Physical visual body representation
         self.body = obs.DrawableRect(
-            width=self.width_cells,
-            height=self.length_cells,
+            width=self.length_cells,
+            height=self.width_cells,
             fill_color=(0.9, 0.0, 0.0),
             parent=self,
         )
         self.body.origin = (0.5 - self.wheelbase_offset / self.length_cells, 0.5)
+        self.forward = obs.DrawableLineStrip((length / 2., 0), 0, 0, 0, color=(1.0, 0.1, 0.5), line_width=2.0,
+                                             parent=self.body)
         self.add(self.body)
+        #self.add(self.forward)
 
         # Kinematics
         self.turn_radius = (
-            turn_radius if turn_radius is not None else self.wheelbase_cells * 1.5
+            ui.meters_to_cells(turn_radius) if turn_radius is not None else self.wheelbase_cells * 1.5
         )
 
         # Motion execution queue
@@ -231,7 +235,7 @@ class Firetruck(obs.DrawableGroup):
         for p in paths:
             self._waypoint_queue.extend(p.waypoints())
 
-    def step(self, dt: float, speed_cells_per_sec: float = 5.0) -> None:
+    def step(self, dt: float, speed_cells_per_sec: float = ui.meters_to_cells(10)) -> None:
         """
         Advances the vehicle pose along the queued Reeds-Shepp waypoints.
         Moves only the body rectangle as it navigates.

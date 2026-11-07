@@ -27,7 +27,7 @@ checkbox_toggle_callback = None
 
 # Vehicle & MotionPrimitive manual control hooks
 active_vehicle = None
-run_astar_callback = None
+run_planning_callback = None
 clear_visualization_callback = None
 enqueue_motion_callback = None
 
@@ -132,10 +132,10 @@ def enqueue_selected_mp():
             active_vehicle.queue_motion(_selected_mp)
 
 
-def on_run_astar():
+def on_run_planning():
     """Runs A* search from current position."""
-    if run_astar_callback is not None:
-        run_astar_callback()
+    if run_planning_callback is not None:
+        run_planning_callback()
     elif active_vehicle is not None:
         try:
             from valet.planner import MPSearchNode
@@ -265,8 +265,8 @@ def create_window(vehicle=None):
     start_button.grid(row=1, column=0, padx=5, pady=2, sticky='ew')
     stop_button = ttk.Button(frame, text='Stop', command=stop_time)
     stop_button.grid(row=2, column=0, padx=5, pady=2, sticky='ew')
-    run_astar_button = ttk.Button(frame, text='Run A*', command=on_run_astar)
-    run_astar_button.grid(row=3, column=0, padx=5, pady=2, sticky='ew')
+    run_planning_button = ttk.Button(frame, text='Run Planning', command=on_run_planning)
+    run_planning_button.grid(row=3, column=0, padx=5, pady=2, sticky='ew')
     clear_button = ttk.Button(frame, text='Clear Primitives', command=on_clear_visuals)
     clear_button.grid(row=4, column=0, padx=5, pady=2, sticky='ew')
 
