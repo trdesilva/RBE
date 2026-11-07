@@ -236,28 +236,74 @@ class Firetruck(obs.DrawableGroup):
 
     def queue_paths(self, paths: List[rsplan.primitives.Path]) -> None:
         """Enqueues waypoints from a sequence of rsplan Paths for navigation."""
-        pass
+        for path in paths:
+            self._segment_queue.extend(path.segments)
+        if len(self._segment_queue) > 0:
+            self._waypoint_queue = self._segment_queue[0].waypoints()
 
     def step(self, dt: float) -> None:
         """
         Advances the vehicle pose along the queued Reeds-Shepp waypoints.
         Moves only the body rectangle as it navigates.
-        Pseudo-Python implementation:
-        distance_to_cover = dt * self.speed
-        distance_per_waypoint = segment.length/len(self._waypoint_queue)
-        while distance_to_cover > distance_per_waypoint:
-            distance_to_cover -= distance_per_waypoint
-            self._step_dist += distance_per_waypoint
-            if self._step_dist > segment.length:
-                self._step_dist -= segment.length
-                segment = get_next_segment_and_pop_queue()
-                self._waypoint_queue = segment.waypoints
-                distance_per_waypoint = segment.length/len(self._waypoint_queue)
-            segment_progress = self._step_dist/segment.length
-            self.set_pose(self._waypoint_queue[segment_progress*len(self._waypoint_queue)])
-        self._step_dist += distance_to_cover
-        segment_progress = self._step_dist/segment.length
-        waypoint_progress = (self._step_dist % distance_per_waypoint)/distance_per_waypoint
-        self.set_pose(linear_interpolate_between_waypoints(segment_progress, waypoint_progress))
         """
-        pass
+        segment = self._segment_queue[0]
+        seg_len = abs(segment.length)
+        if seg_len == 0 or len(self._waypoint_queue) == 0:
+            return
+
+        distance_to_cover = dt * self.speed
+        num_intervals = max(len(self._waypoint_queue) - 1, 1)
+        distance_per_waypoint = seg_len / num_intervals
+        if distance_per_waypoint == 0:
+            return
+
+        rem = self._step_dist % distance_per_waypoint
+        dist_to_next = distance_per_waypoint - rem if rem > 1e-9 else distance_per_waypoint
+
+        while distance_to_cover >= dist_to_next - 1e-9:
+            distance_to_cover = max(0.0, distance_to_cover - dist_to_next)
+            self._step_dist += dist_to_next
+            if self._step_dist >= seg_len - 1e-9:
+                self._step_dist -= seg_len
+                if self._step_dist < 0:
+                    self._step_dist = 0.0
+                last_wp = self._waypoint_queue[-1]
+                self._segment_queue.pop(0)
+                if not self._segment_queue:
+                    self._waypoint_queue = []
+                    self.set_pose(last_wp.x, last_wp.y, last_wp.yaw)
+                    return
+                segment = self._segment_queue[0]
+                self._waypoint_queue = segment.waypoints() if callable(getattr(segment, "waypoints", None)) else getattr(segment, "waypoints", [])
+                if not self._waypoint_queue:
+                    return
+                seg_len = abs(segment.length)
+                if seg_len == 0:
+                    return
+                num_intervals = max(len(self._waypoint_queue) - 1, 1)
+                distance_per_waypoint = seg_len / num_intervals
+                if distance_per_waypoint == 0:
+                    return
+
+            segment_progress = self._step_dist / seg_len
+            idx = min(int(segment_progress * num_intervals), len(self._waypoint_queue) - 1)
+            wp = self._waypoint_queue[idx]
+            self.set_pose(wp.x, wp.y, wp.yaw)
+            dist_to_next = distance_per_waypoint
+
+        self._step_dist += distance_to_cover
+        segment_progress = self._step_dist / seg_len
+        waypoint_progress = (self._step_dist % distance_per_waypoint) / distance_per_waypoint if distance_per_waypoint > 0 else 0.0
+
+        idx = min(int(segment_progress * num_intervals), len(self._waypoint_queue) - 1)
+        if idx < len(self._waypoint_queue) - 1:
+            wp1 = self._waypoint_queue[idx]
+            wp2 = self._waypoint_queue[idx + 1]
+            interp_x = wp1.x + waypoint_progress * (wp2.x - wp1.x)
+            interp_y = wp1.y + waypoint_progress * (wp2.y - wp1.y)
+            dyaw = (wp2.yaw - wp1.yaw + math.pi) % (2.0 * math.pi) - math.pi
+            interp_yaw = wp1.yaw + waypoint_progress * dyaw
+            self.set_pose(interp_x, interp_y, interp_yaw)
+        else:
+            wp = self._waypoint_queue[idx]
+            self.set_pose(wp.x, wp.y, wp.yaw)
