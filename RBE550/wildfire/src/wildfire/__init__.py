@@ -28,6 +28,9 @@ def main() -> None:
     _canvas.add_drawable(truck)
     _canvas.add_drawable(wump)
 
+    truck.prm.visualizer.canvas = _canvas
+    ui.checkbox_toggle_callback = truck.prm.visualizer.update_visualization
+
     def step_time_callback():
         global sim_time
         dt = ui.time_rate / ui.fps
@@ -53,6 +56,7 @@ def main() -> None:
 
     def run_planning():
         truck.prm.generate_roadmap()
+        _canvas.redraw()
 
     ui.run_planning_callback = run_planning
     _root_window.mainloop()

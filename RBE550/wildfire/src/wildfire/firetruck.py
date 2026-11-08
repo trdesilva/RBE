@@ -2,7 +2,7 @@ import astar
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import fastquadtree as qt
 import numpy as np
@@ -21,7 +21,7 @@ class PRMNode:
     id: int
     pose: Tuple[float, float, float]  # (x, y, theta) in cells and radians
     def __hash__(self) -> int:
-        return hash(id) + 11*hash(self.pose)
+        return hash(self.id) + 11*hash(self.pose)
 
 @dataclass
 class PRMEdge:
@@ -30,6 +30,10 @@ class PRMEdge:
     target_id: int
     path: rsplan.primitives.Path
     cost: float
+    line_strip: Optional[obs.DrawableLineStrip] = None
+
+    def __hash__(self) -> int:
+        return hash((self.source_id, self.target_id))
 
 @dataclass
 class AStarData:
@@ -37,6 +41,126 @@ class AStarData:
     is_goal: bool = False
     def __hash__(self) -> int:
         return hash(self.data) + 101*hash(self.is_goal)
+
+
+class PRMVisualizer:
+    """
+    Manages debug visualization of PRM roadmap edges and A* query exploration
+    using DrawableLineStrips.
+    """
+    def __init__(self, canvas=None):
+        self.canvas = canvas
+        self.edges_with_strips: List[PRMEdge] = []
+        self.explored_edges: Set[PRMEdge] = set()
+        self.cost_values: Dict[PRMEdge, float] = {}
+        self.heur_values: Dict[int, float] = {}
+        self.optimal_path_edges: Set[PRMEdge] = set()
+        self.gradient_values: List[float] = []
+        self.value_cache: Optional[np.ndarray] = None
+
+    def add_edge(self, edge: PRMEdge, strip: obs.DrawableLineStrip) -> None:
+        """Registers a new roadmap edge and adds its line strip to the canvas."""
+        self.edges_with_strips.append(edge)
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if canvas is not None and getattr(canvas, 'drawables', None) is not None:
+            if strip not in canvas.drawables:
+                canvas.add_drawable(strip)
+
+    def update_cost_display(self, edge: PRMEdge, cost: float) -> None:
+        """Records the cost for an explored edge and updates its visual representation."""
+        self.cost_values[edge] = cost
+        self.explored_edges.add(edge)
+        if edge.line_strip is not None and (ui.should_draw_cost() or ui.should_draw_heur()):
+            heur = self.heur_values.get(edge.target_id, 0.0) if ui.should_draw_heur() else 0.0
+            c = cost if ui.should_draw_cost() else 0.0
+            val = c + heur
+            edge.line_strip.color = self.get_gradient_color(val)
+            edge.line_strip.line_width = 1.5
+
+    def update_heuristic_display(self, node_id: int, heur: float) -> None:
+        """Records the heuristic estimate for a PRM node."""
+        self.heur_values[node_id] = heur
+
+    def set_optimal_path(self, edges: List[PRMEdge]) -> None:
+        """Sets the optimal path edges to highlight upon A* query completion."""
+        self.optimal_path_edges = set(edges)
+
+    def get_gradient_color(self, value: float) -> str:
+        """Computes HSV gradient color for an active value using a dynamic histogram."""
+        self.gradient_values.append(float(value))
+        if len(self.gradient_values) > 1:
+            self.value_cache = np.histogram_bin_edges(np.sort(self.gradient_values), 10)
+            normalized = np.searchsorted(self.value_cache, value) / self.value_cache.size
+        else:
+            normalized = 0.0
+        return obs.get_hsv_gradient(float(np.clip(normalized, 0.0, 1.0)), 1.0, alpha=0.5)
+
+    def clear(self) -> None:
+        """Clears all drawn line strips from the canvas and resets state."""
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if canvas is not None and getattr(canvas, 'drawables', None) is not None:
+            for edge in self.edges_with_strips:
+                if edge.line_strip is not None and edge.line_strip in canvas.drawables:
+                    canvas.remove_drawable(edge.line_strip)
+        self.edges_with_strips.clear()
+        self.explored_edges.clear()
+        self.cost_values.clear()
+        self.heur_values.clear()
+        self.optimal_path_edges.clear()
+        self.gradient_values.clear()
+        self.value_cache = None
+
+    def update_visualization(self) -> None:
+        """Re-evaluates visibility and gradient colors when checkboxes are toggled or display updates."""
+        show_path = ui.should_draw_path()
+        show_cost = ui.should_draw_cost()
+        show_heur = ui.should_draw_heur()
+
+        active_vals = []
+        edge_vals = {}
+        for edge in self.explored_edges:
+            c = self.cost_values.get(edge, 0.0)
+            h = self.heur_values.get(edge.target_id, 0.0)
+            if show_cost and show_heur:
+                v = c + h
+            elif show_cost:
+                v = c
+            elif show_heur:
+                v = h
+            else:
+                v = None
+            edge_vals[edge] = v
+            if v is not None:
+                active_vals.append(v)
+
+        edges = np.histogram_bin_edges(np.sort(active_vals), 10) if len(active_vals) > 1 else None
+
+        for edge in self.edges_with_strips:
+            strip = edge.line_strip
+            if strip is None:
+                continue
+
+            strip.visible = show_path
+
+            if edge in self.optimal_path_edges:
+                strip.color = '#00ff00'
+                strip.line_width = 3.0
+            elif edge in self.explored_edges and (show_cost or show_heur):
+                strip.line_width = 1.5
+                v = edge_vals.get(edge)
+                if v is not None and edges is not None and edges.size > 0:
+                    norm = np.searchsorted(edges, v) / edges.size
+                    strip.color = obs.get_hsv_gradient(float(np.clip(norm, 0.0, 1.0)), 1.0, alpha=0.5)
+                else:
+                    strip.color = obs.get_hsv_gradient(0.0, 1.0, alpha=0.5)
+            else:
+                strip.color = (0.5, 0.5, 0.5, 0.5)
+                strip.line_width = 1.0
+
+        canvas = self.canvas if self.canvas is not None else obs._active_widget
+        if canvas is not None and getattr(canvas, 'context_created', False):
+            canvas.redraw()
+
 
 class PRMPlanner(AStar):
     """
@@ -74,6 +198,7 @@ class PRMPlanner(AStar):
         self.nodes: List[PRMNode] = []
         self.adj_list: Dict[int, List[PRMEdge]] = {}
         self.node_quadtree = qt.QuadTreeObjects(bounds, capacity=num_samples)
+        self.visualizer: PRMVisualizer = PRMVisualizer()
 
     def is_pose_collision_free(self, x: float, y: float, theta: float) -> bool:
         """Checks whether placing the vehicle footprint at (x, y, theta) causes a collision."""
@@ -137,6 +262,8 @@ class PRMPlanner(AStar):
         self.nodes.clear()
         self.adj_list.clear()
         self.node_quadtree.clear()
+        if self.visualizer is not None:
+            self.visualizer.clear()
 
         # Step 1: Sample vertices
         print(f'PRM sampling {self.num_samples} vertices...')
@@ -164,15 +291,27 @@ class PRMPlanner(AStar):
             for _, target_id, target_node in distances[: self.k_neighbors]:
                 path = self.plan_local_path(node.pose, target_node.pose)
                 if path is not None:
+                    strip = obs.DrawableLineStrip(
+                        vertices=[(wp.x, wp.y) for wp in path.waypoints()],
+                        color=(0.5, 0.5, 0.5, 0.5),
+                        line_width=1.0,
+                        visible=ui.should_draw_path(),
+                    )
                     edge = PRMEdge(
                         source_id=node.id,
                         target_id=target_id,
                         path=path,
                         cost=path.total_length,
+                        line_strip=strip,
                     )
                     self.adj_list[node.id].append(edge)
+                    if self.visualizer is not None:
+                        self.visualizer.add_edge(edge, strip)
             if (i + 1) % (self.num_samples / 10) < 1:
                 print(f'PRM connected {i + 1} nodes')
+
+        if self.visualizer is not None:
+            self.visualizer.update_visualization()
 
     def query(
         self,
@@ -181,7 +320,6 @@ class PRMPlanner(AStar):
     ) -> Optional[List[rsplan.primitives.Path]]:
         """
         Connects start_pose to the roadmap and finds an A* path to a vertex within goal_region.
-        (Implementation will be expanded in subsequent steps).
         """
         if len(self.nodes) == 0:
             self.generate_roadmap()
@@ -195,10 +333,25 @@ class PRMPlanner(AStar):
                     break
         if len(valid_connections) > 0:
             valid_connections.sort(key=lambda p: p[0].total_length)
-            path = [valid_connections[0][0]]
-            rest = self.astar(AStarData(valid_connections[0][1]), AStarData(goal_region, True))
+            start_path = valid_connections[0][0]
+            first_node = valid_connections[0][1]
+            path = [start_path]
+            rest = self.astar(AStarData(first_node), AStarData(goal_region, True))
             if rest is not None:
-                path.extend(rest)
+                node_list = list(rest)
+                optimal_edges = []
+                for a, b in zip(node_list[:-1], node_list[1:]):
+                    if not a.is_goal and not b.is_goal:
+                        prm_a = a.data
+                        prm_b = b.data
+                        for edge in self.adj_list.get(prm_a.id, []):
+                            if edge.target_id == prm_b.id:
+                                optimal_edges.append(edge)
+                                path.append(edge.path)
+                                break
+                if self.visualizer is not None:
+                    self.visualizer.set_optimal_path(optimal_edges)
+                    self.visualizer.update_visualization()
                 return path
             else:
                 print(f'ExtRegion {goal_region} is not reachable from {start_pose}.')
@@ -218,7 +371,10 @@ class PRMPlanner(AStar):
 
     def heuristic_cost_estimate(self, current: AStarData, goal: AStarData) -> float:
         if not current.is_goal and goal.is_goal:
-            return goal.data.get_minimum_distance(current.data.pose[0], current.data.pose[1])
+            result = goal.data.get_minimum_distance(current.data.pose[0], current.data.pose[1])
+            if self.visualizer is not None:
+                self.visualizer.update_heuristic_display(current.data.id, result)
+            return result
         return np.inf
 
     def path_distance_between(self, n1: astar.SearchNode[AStarData], n2: astar.SearchNode[AStarData]) -> float:
@@ -228,6 +384,8 @@ class PRMPlanner(AStar):
         prm_n2 = n2.data.data
         for edge in self.adj_list[prm_n1.id]:
             if edge.target_id == prm_n2.id:
+                if self.visualizer is not None:
+                    self.visualizer.update_cost_display(edge, edge.cost)
                 return edge.cost
         return np.inf
 
@@ -235,16 +393,6 @@ class PRMPlanner(AStar):
         if not current.is_goal and goal.is_goal:
             return goal.data.contains(current.data.pose[0], current.data.pose[1])
         return False
-
-
-# TODO: Design PRMVisualizer
-# Responsibilities to address:
-# - Track newly added vs. already drawn nodes and edges to avoid re-rendering entire sets
-# - Decouple PRM debug visualization from Firetruck actor
-class PRMVisualizer:
-    """Placeholder for PRM visualization; will be designed after planner logic stabilizes."""
-    def __init__(self, canvas=None):
-        self.canvas = canvas
 
 
 class Firetruck(obs.DrawableGroup):
@@ -337,6 +485,10 @@ class Firetruck(obs.DrawableGroup):
 
         if len(self._segment_queue) == 0:
             return
+
+        if dt <= 0 or self.speed <= 0 or not self._waypoint_queue:
+            return
+
         segment = self._segment_queue[0]
         seg_len = abs(segment.length)
         if seg_len == 0 or len(self._waypoint_queue) == 0:
