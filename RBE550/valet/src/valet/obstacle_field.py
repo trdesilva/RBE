@@ -1218,23 +1218,25 @@ def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
     total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
     print(f'Placing {total} tetrominoes...')
     tets_to_place = _rng.integers(len(tetrominoes), size=total)
-    placed_coords = {}
+    cell_to_root = {}
+    root_to_cells = {}
     for tet in tets_to_place:
         tet_cells = tetrominoes[tet]
         tet_bounds = np.shape(tet_cells)
         x = _rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
         y = _rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
+        root_to_cells[(x, y)] = []
         for i in np.ndindex(tet_bounds):
             if tet_cells[i] == 1:
                 cy, cx = y + i[0], x + i[1]
+                cell_to_root[(cx, cy)] = (x,y)
+                root_to_cells[(x, y)].append((cx, cy))
                 cell = _cells[cy][cx]
                 if len(cell) > 0:
                     cell[0] = tet_cells[i]
                 else:
                     cell.append(tet_cells[i])
                     obs_quadtree.insert((cx, cy, cx + 1, cy + 1))
-
-        placed_coords[(x, y)] = tet_cells
 
     # Vectorized color assignment for occupied cells
     wall_rgb = convert_text_to_rgb(_fill_func([1]))
@@ -1243,7 +1245,7 @@ def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
 
     if canvas is not None:
         draw_grid()
-    return placed_coords
+    return root_to_cells, cell_to_root
 
 __bounds_cache: dict[tuple[int, int, int, int, int], np.ndarray] = {}
 

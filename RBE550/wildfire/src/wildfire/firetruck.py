@@ -246,6 +246,9 @@ class Firetruck(obs.DrawableGroup):
         Advances the vehicle pose along the queued Reeds-Shepp waypoints.
         Moves only the body rectangle as it navigates.
         """
+        if len(self._segment_queue) == 0:
+            # TODO plan here
+            return
         segment = self._segment_queue[0]
         seg_len = abs(segment.length)
         if seg_len == 0 or len(self._waypoint_queue) == 0:

@@ -1,3 +1,5 @@
+import functools
+
 import fastquadtree as qt
 import numpy as np
 from astar import AStar, T, SearchNode
@@ -5,6 +7,7 @@ from astar import AStar, T, SearchNode
 import valet.grid_sim as ui
 import valet.obstacle_field as obs
 import valet.planner as vp
+import shrubbery as shr
 
 class Wumpus(obs.DrawableGroup, AStar):
     def __init__(self, x: float, y: float, grid_width: int, grid_height: int, obs_quadtree: qt.RectQuadTree, wumpus_grid_res: int = 3, speed: float= 2.0) -> None:
@@ -59,22 +62,22 @@ class Wumpus(obs.DrawableGroup, AStar):
             print(f'wumpus failed to path')
 
     def ignite_neighbors(self):
-        pass
+        for i in [(-1., 0), (1., 0), (0, -1.), (0, 1.)]:
+            x, y = (self.x + i[0]/self.wumpus_grid_res, self.y + i[1]/self.wumpus_grid_res)
+            # obstacles only exist within integer cell boundaries
+            if (((x % 1 < 1./self.wumpus_grid_res) or (1 - (x % 1) < 1./self.wumpus_grid_res)) and
+                ((y % 1 < 1. / self.wumpus_grid_res) or (1 - (y % 1) < 1. / self.wumpus_grid_res))):
+                shr.ignite(int(x), int(y))
 
-    def check_collision(self, wump_coords = None, obs_quadtree = None):
+    @functools.cache
+    def _check_collision_cached(self, wump_coords):
+        world_coords = (int(float(wump_coords[0])/self.wumpus_grid_res), int(float(wump_coords[1])/self.wumpus_grid_res))
+        return shr.get_state(*world_coords) > 0
+
+    def check_collision(self, wump_coords = None):
         if wump_coords is None:
             wump_coords = (round(self.x * self.wumpus_grid_res), round(self.y * self.wumpus_grid_res))
-        if obs_quadtree is None:
-            obs_quadtree = self.obs_quadtree
-        world_coords = (float(wump_coords[0])/self.wumpus_grid_res, float(wump_coords[1])/self.wumpus_grid_res)
-        # TODO this is way slower than just directly checking obs._cells, especially since nearest_neighbors has weird
-        # TODO boundary behaviour
-        nearest_obstacles = obs_quadtree.nearest_neighbors(tuple(world_coords), 4)
-        for nearest_obstacle in nearest_obstacles:
-            if (nearest_obstacle is not None and int(world_coords[0]) == round(nearest_obstacle[1]) and
-                int(world_coords[1]) == round(nearest_obstacle[2])):
-                    return True
-        return False
+        return self._check_collision_cached(wump_coords)
 
     """
     A* Impl
