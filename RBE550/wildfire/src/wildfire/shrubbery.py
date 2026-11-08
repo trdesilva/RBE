@@ -145,11 +145,13 @@ class ExtRegion(obs.DrawableGroup):
     @functools.lru_cache(maxsize=250)
     def get_minimum_distance(self, x, y):
         minimum = np.inf
+        min_vert= None
         for v in self.verts:
             check = (v[0] - x) ** 2 + (v[1] - y) ** 2
             if check < minimum:
                 minimum = check
-        return np.sqrt(minimum)
+                min_vert = v
+        return np.sqrt(minimum), min_vert
 
 
 def set_current_goal(goal: ExtRegion | None):

@@ -180,7 +180,8 @@ class PRMPlanner(AStar):
         step_size: float = 0.1,
         num_samples: int = 100,
         connection_radius: float = 8.0,
-        k_neighbors: int = 10,
+        k_neighbors: int = 4,
+        sample_dist_ratio = 4.0
     ):
         self.obs_quadtree = obs_quadtree
         self.bounds = bounds  # (min_x, min_y, max_x, max_y)
@@ -189,6 +190,7 @@ class PRMPlanner(AStar):
         self.num_samples = num_samples
         self.connection_radius = connection_radius
         self.k_neighbors = k_neighbors
+        self.sample_dist_ratio = sample_dist_ratio
 
         # Independent test body for intrinsic collision verification along trajectories
         self._test_body = body_prototype.copy()
@@ -241,23 +243,139 @@ class PRMPlanner(AStar):
             return candidate_path
         return None
 
-    def sample_free_pose(self) -> Optional[Tuple[float, float, float]]:
-        """Uniformly samples a collision-free configuration (x, y, theta) within field bounds."""
+    def add_node(self, pose: Tuple[float, float, float]) -> PRMNode:
+        """Adds a new collision-free PRMNode to the roadmap and spatial index."""
+        node_id = len(self.nodes)
+        new_node = PRMNode(id=node_id, pose=pose)
+        self.nodes.append(new_node)
+        self.adj_list[node_id] = []
+        self.node_quadtree.insert((pose[0], pose[1]), new_node)
+        return new_node
+
+    def sample_uniform_nodes(self, target_count: int, batch_size: int = 200) -> None:
+        """Uniformly samples collision-free configurations using NumPy batches until target_count is reached."""
         min_x, min_y, max_x, max_y = self.bounds
-        for _ in range(100):  # limit attempts per sample call
-            x = random.uniform(min_x, max_x)
-            y = random.uniform(min_y, max_y)
-            theta = random.uniform(-math.pi, math.pi)
-            if self.is_pose_collision_free(x, y, theta):
-                return (x, y, theta)
-        return None
+        while len(self.nodes) < target_count:
+            xs = np.random.uniform(min_x, max_x, batch_size)
+            ys = np.random.uniform(min_y, max_y, batch_size)
+            thetas = np.random.uniform(-np.pi, np.pi, batch_size)
+            for x, y, theta in zip(xs, ys, thetas):
+                fx, fy, ftheta = float(x), float(y), float(theta)
+                if self.is_pose_collision_free(fx, fy, ftheta):
+                    self.add_node((fx, fy, ftheta))
+                    if len(self.nodes) >= target_count:
+                        break
+
+    def sample_gaussian_nodes(
+        self,
+        target_count: int,
+        batch_size: int = 200,
+        std: float = 0.5,
+        std_theta: float = np.pi/16,
+        max_batches: int = 1000,
+    ) -> None:
+        """
+        Samples configurations near obstacles using NumPy batches of Gaussian perturbations.
+        For each pair (s1, s2) where s1 is uniform and s2 ~ N(s1, sigma), adds the collision-free
+        sample to self.nodes if and only if one sample collides and the other does not.
+        """
+        min_x, min_y, max_x, max_y = self.bounds
+        batch_count = 0
+        while len(self.nodes) < target_count and batch_count < max_batches:
+            batch_count += 1
+            xs1 = np.random.uniform(min_x, max_x, batch_size)
+            ys1 = np.random.uniform(min_y, max_y, batch_size)
+            thetas1 = np.random.uniform(-np.pi, np.pi, batch_size)
+
+            xs2 = np.random.normal(xs1, std)
+            ys2 = np.random.normal(ys1, std)
+            thetas2 = (np.random.normal(thetas1, std_theta) + np.pi) % (2.0 * np.pi) - np.pi
+
+            valid_mask = (xs2 >= min_x) & (xs2 <= max_x) & (ys2 >= min_y) & (ys2 <= max_y)
+            valid_xs1 = xs1[valid_mask]
+            valid_ys1 = ys1[valid_mask]
+            valid_thetas1 = thetas1[valid_mask]
+            valid_xs2 = xs2[valid_mask]
+            valid_ys2 = ys2[valid_mask]
+            valid_thetas2 = thetas2[valid_mask]
+
+            for x1, y1, th1, x2, y2, th2 in zip(
+                valid_xs1, valid_ys1, valid_thetas1, valid_xs2, valid_ys2, valid_thetas2
+            ):
+                fx1, fy1, fth1 = float(x1), float(y1), float(th1)
+                fx2, fy2, fth2 = float(x2), float(y2), float(th2)
+
+                c1 = not self.is_pose_collision_free(fx1, fy1, fth1)
+                c2 = not self.is_pose_collision_free(fx2, fy2, fth2)
+
+                if c1 != c2:
+                    free_pose = (fx1, fy1, fth1) if not c1 else (fx2, fy2, fth2)
+                    self.add_node(free_pose)
+                    if len(self.nodes) >= target_count:
+                        break
+
+    def connect_node(
+        self,
+        node: PRMNode,
+        max_edges: Optional[int] = None,
+        add_to_graph: bool = True,
+    ) -> List[PRMEdge]:
+        """
+        Connects a single PRMNode to the roadmap.
+        Uses node_quadtree to sample the nearest 4*self.k_neighbors candidates instead
+        of sorting the entire set of nodes.
+        Terminates as soon as target_k valid collision-free edges are generated.
+        """
+        target_k = max_edges if max_edges is not None else self.k_neighbors
+        if len(self.nodes) == 0 or target_k <= 0:
+            return []
+
+        # Sample the nearest 4*k (+1 to account for node itself if in tree)
+        sample_count = min(len(self.nodes) + 1, 4 * target_k + 1)
+        nearest_items = self.node_quadtree.nearest_neighbors((node.pose[0], node.pose[1]), sample_count)
+
+        edges: List[PRMEdge] = []
+        for item in nearest_items:
+            target_node: PRMNode = item.obj
+            if target_node.id == node.id:
+                continue
+
+            d = math.hypot(node.pose[0] - target_node.pose[0], node.pose[1] - target_node.pose[1])
+            if d > self.connection_radius:
+                continue
+
+            path = self.plan_local_path(node.pose, target_node.pose)
+            if path is not None:
+                strip = obs.DrawableLineStrip(
+                    vertices=[(wp.x, wp.y) for wp in path.waypoints()],
+                    color=(0.5, 0.5, 0.5, 0.5),
+                    line_width=1.0,
+                    visible=ui.should_draw_path(),
+                )
+                edge = PRMEdge(
+                    source_id=node.id,
+                    target_id=target_node.id,
+                    path=path,
+                    cost=path.total_length,
+                    line_strip=strip,
+                )
+                if add_to_graph and node.id in self.adj_list:
+                    self.adj_list[node.id].append(edge)
+                    if self.visualizer is not None:
+                        self.visualizer.add_edge(edge, strip)
+
+                edges.append(edge)
+                if len(edges) >= target_k:
+                    break
+
+        return edges
 
     def generate_roadmap(self) -> None:
         """
         Constructs the roadmap once before simulation starts:
-        1. Samples random collision-free configurations.
-        2. Finds candidate neighbor pairs within connection_radius.
-        3. Connects neighbors with collision-free Reeds-Shepp paths.
+        1. Samples random collision-free configurations (first 1/sample_dist_ratio uniform, rest Gaussian near obstacles).
+        2. Finds candidate neighbor pairs within connection_radius using node_quadtree.
+        3. Connects neighbors with collision-free Reeds-Shepp paths using connect_node.
         """
         self.nodes.clear()
         self.adj_list.clear()
@@ -267,49 +385,21 @@ class PRMPlanner(AStar):
 
         # Step 1: Sample vertices
         print(f'PRM sampling {self.num_samples} vertices...')
-        while len(self.nodes) < self.num_samples:
-            pose = self.sample_free_pose()
-            if pose is not None:
-                node_id = len(self.nodes)
-                new_node = PRMNode(id=node_id, pose=pose)
-                self.nodes.append(new_node)
-                self.adj_list[node_id] = []
-                self.node_quadtree.insert((pose[0], pose[1]), new_node)
+
+        # First half: uniform random strategy
+        self.sample_uniform_nodes(target_count=int(self.num_samples/self.sample_dist_ratio))
+
+        # Second half: Gaussian sampler near obstacles
+        self.sample_gaussian_nodes(target_count=self.num_samples)
 
         # Step 2 & 3: Connect k-nearest neighbors with Reeds-Shepp paths
         print(f'PRM connecting {len(self.nodes)} nodes...')
         for i, node in enumerate(self.nodes):
-            distances = []
-            for j, other in enumerate(self.nodes):
-                if i == j:
-                    continue
-                d = math.hypot(node.pose[0] - other.pose[0], node.pose[1] - other.pose[1])
-                if d <= self.connection_radius:
-                    distances.append((d, j, other))
-
-            distances.sort(key=lambda t: t[0])
-            for _, target_id, target_node in distances[: self.k_neighbors]:
-                path = self.plan_local_path(node.pose, target_node.pose)
-                if path is not None:
-                    strip = obs.DrawableLineStrip(
-                        vertices=[(wp.x, wp.y) for wp in path.waypoints()],
-                        color=(0.5, 0.5, 0.5, 0.5),
-                        line_width=1.0,
-                        visible=ui.should_draw_path(),
-                    )
-                    edge = PRMEdge(
-                        source_id=node.id,
-                        target_id=target_id,
-                        path=path,
-                        cost=path.total_length,
-                        line_strip=strip,
-                    )
-                    self.adj_list[node.id].append(edge)
-                    if self.visualizer is not None:
-                        self.visualizer.add_edge(edge, strip)
-            if (i + 1) % (self.num_samples / 100) < 1:
-                self.visualizer.update_visualization()
-            if (i + 1) % (self.num_samples / 10) < 1:
+            self.connect_node(node, add_to_graph=True)
+            if (i + 1) % max(1, int(self.num_samples / 100)) < 1:
+                if self.visualizer is not None:
+                    self.visualizer.update_visualization()
+            if (i + 1) % max(1, int(self.num_samples / 10)) < 1:
                 print(f'PRM connected {i + 1} nodes')
 
         if self.visualizer is not None:
@@ -327,18 +417,17 @@ class PRMPlanner(AStar):
             return None
         if len(self.nodes) == 0:
             self.generate_roadmap()
-        nearest_nodes = self.node_quadtree.nearest_neighbors((start_pose[0], start_pose[1]), 20)
-        valid_connections = []
-        for node in nearest_nodes:
-            path = self.plan_local_path(start_pose, node.obj.pose)
-            if path is not None:
-                valid_connections.append((path, node.obj))
-                if len(valid_connections) >= 10:
-                    break
+
+        # Temporary start node with out-of-bounds positive ID so it cannot be
+        # accessed via negative indexing (e.g. self.nodes[-1]) or modify self.nodes / self.adj_list.
+        start_node = PRMNode(id=len(self.nodes), pose=start_pose)
+        valid_connections = self.connect_node(start_node, max_edges=max(10, self.k_neighbors), add_to_graph=False)
+
         if len(valid_connections) > 0:
-            valid_connections.sort(key=lambda p: p[0].total_length)
-            start_path = valid_connections[0][0]
-            first_node = valid_connections[0][1]
+            valid_connections.sort(key=lambda edge: edge.cost)
+            start_edge = valid_connections[0]
+            start_path = start_edge.path
+            first_node = self.nodes[start_edge.target_id]
             path = [start_path]
             rest = self.astar(AStarData(first_node), AStarData(goal_region, True))
             if rest is not None:
@@ -375,7 +464,15 @@ class PRMPlanner(AStar):
 
     def heuristic_cost_estimate(self, current: AStarData, goal: AStarData) -> float:
         if not current.is_goal and goal.is_goal and goal.data is not None:
-            result = goal.data.get_minimum_distance(current.data.pose[0], current.data.pose[1])
+            dist_to_goal, goal_vert = goal.data.get_minimum_distance(current.data.pose[0], current.data.pose[1])
+            gx, gy = goal_vert
+            cx, cy, ctheta = current.data.pose
+            max_dist_to_goal = float(np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2))
+            xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
+            angle_to_goal = np.atan2(gy - cx, gx - cy)
+            # prefer pointing at goal when far away and being parallel with goal when close
+            heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (np.sin(abs(ctheta)))
+            result = dist_to_goal + heading_heur
             if self.visualizer is not None:
                 self.visualizer.update_heuristic_display(current.data.id, result)
             return result
@@ -389,6 +486,13 @@ class PRMPlanner(AStar):
         for edge in self.adj_list[prm_n1.id]:
             if edge.target_id == prm_n2.id:
                 if self.visualizer is not None:
+                    cost = edge.cost
+                    waypoints = edge.path.waypoints()
+                    segments = edge.path.segments
+                    for i in range(1, len(waypoints)):
+                        cost += abs(waypoints[i].yaw - waypoints[i - 1].yaw)/(2*len(waypoints))
+                    for i in range(1, len(segments)):
+                        cost *= 1.5 if segments[i].direction != segments[i - 1].direction else 1
                     self.visualizer.update_cost_display(edge, edge.cost)
                 return edge.cost
         return np.inf
@@ -444,7 +548,7 @@ class Firetruck(obs.DrawableGroup):
         )
         self.speed = ui.meters_to_cells(speed)
 
-        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 25*25, 5, 5)
+        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 200, 10, 16, 5)
 
         # Motion execution queue
         self._path_queue = []
@@ -567,4 +671,3 @@ class Firetruck(obs.DrawableGroup):
         else:
             wp = self._waypoint_queue[idx]
             self.set_pose(wp.x, wp.y, wp.yaw)
-
