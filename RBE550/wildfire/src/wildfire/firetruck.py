@@ -1,3 +1,4 @@
+import astar
 import math
 import random
 from dataclasses import dataclass
@@ -6,17 +7,21 @@ from typing import Dict, List, Optional, Tuple
 import fastquadtree as qt
 import numpy as np
 import rsplan
+from astar import AStar
+
 import valet.grid_sim as ui
 import valet.obstacle_field as obs
 import valet.planner as vp
 
+import shrubbery as shr
 
 @dataclass
 class PRMNode:
     """A configuration vertex in the Probabilistic Road Map."""
     id: int
     pose: Tuple[float, float, float]  # (x, y, theta) in cells and radians
-
+    def __hash__(self) -> int:
+        return hash(id) + 11*hash(self.pose)
 
 @dataclass
 class PRMEdge:
@@ -26,8 +31,14 @@ class PRMEdge:
     path: rsplan.primitives.Path
     cost: float
 
+@dataclass
+class AStarData:
+    data: PRMNode|shr.ExtRegion
+    is_goal: bool = False
+    def __hash__(self) -> int:
+        return hash(self.data) + 101*hash(self.is_goal)
 
-class PRMPlanner:
+class PRMPlanner(AStar):
     """
     Probabilistic Road Map (PRM) planner for non-holonomic vehicles using Reeds-Shepp paths.
 
@@ -62,6 +73,7 @@ class PRMPlanner:
         # Roadmap representation
         self.nodes: List[PRMNode] = []
         self.adj_list: Dict[int, List[PRMEdge]] = {}
+        self.node_quadtree = qt.QuadTreeObjects(bounds, capacity=num_samples)
 
     def is_pose_collision_free(self, x: float, y: float, theta: float) -> bool:
         """Checks whether placing the vehicle footprint at (x, y, theta) causes a collision."""
@@ -124,16 +136,21 @@ class PRMPlanner:
         """
         self.nodes.clear()
         self.adj_list.clear()
+        self.node_quadtree.clear()
 
         # Step 1: Sample vertices
+        print(f'PRM sampling {self.num_samples} vertices...')
         while len(self.nodes) < self.num_samples:
             pose = self.sample_free_pose()
             if pose is not None:
                 node_id = len(self.nodes)
-                self.nodes.append(PRMNode(id=node_id, pose=pose))
+                new_node = PRMNode(id=node_id, pose=pose)
+                self.nodes.append(new_node)
                 self.adj_list[node_id] = []
+                self.node_quadtree.insert((pose[0], pose[1]), new_node)
 
         # Step 2 & 3: Connect k-nearest neighbors with Reeds-Shepp paths
+        print(f'PRM connecting {len(self.nodes)} nodes...')
         for i, node in enumerate(self.nodes):
             distances = []
             for j, other in enumerate(self.nodes):
@@ -154,18 +171,70 @@ class PRMPlanner:
                         cost=path.total_length,
                     )
                     self.adj_list[node.id].append(edge)
+            if (i + 1) % (self.num_samples / 10) < 1:
+                print(f'PRM connected {i + 1} nodes')
 
     def query(
         self,
         start_pose: Tuple[float, float, float],
-        goal_region: Tuple[float, float, float, float],
+        goal_region: shr.ExtRegion,
     ) -> Optional[List[rsplan.primitives.Path]]:
         """
         Connects start_pose to the roadmap and finds an A* path to a vertex within goal_region.
         (Implementation will be expanded in subsequent steps).
         """
-        # TODO: Implement A* search on the PRM graph
-        raise NotImplementedError("A* query on PRM roadmap will be implemented in the next step.")
+        if len(self.nodes) == 0:
+            self.generate_roadmap()
+        nearest_nodes = self.node_quadtree.nearest_neighbors((start_pose[0], start_pose[1]), 20)
+        valid_connections = []
+        for node in nearest_nodes:
+            path = self.plan_local_path(start_pose, node.obj.pose)
+            if path is not None:
+                valid_connections.append((path, node.obj))
+                if len(valid_connections) >= 10:
+                    break
+        if len(valid_connections) > 0:
+            valid_connections.sort(key=lambda p: p[0].total_length)
+            path = [valid_connections[0][0]]
+            rest = self.astar(AStarData(valid_connections[0][1]), AStarData(goal_region, True))
+            if rest is not None:
+                path.extend(rest)
+                return path
+            else:
+                print(f'ExtRegion {goal_region} is not reachable from {start_pose}.')
+                return None
+        else:
+            print(f'No valid connections found for {start_pose}')
+            return None
+
+    """
+    A* Impl
+    """
+    def path_neighbors(self, node: astar.SearchNode[AStarData]):
+        if node.data.is_goal:
+            return []
+        prm_node = node.data.data
+        return [AStarData(self.nodes[edge.target_id]) for edge in self.adj_list[prm_node.id]]
+
+    def heuristic_cost_estimate(self, current: AStarData, goal: AStarData) -> float:
+        if not current.is_goal and goal.is_goal:
+            return goal.data.get_minimum_distance(current.data.pose[0], current.data.pose[1])
+        return np.inf
+
+    def path_distance_between(self, n1: astar.SearchNode[AStarData], n2: astar.SearchNode[AStarData]) -> float:
+        if n1.data.is_goal or n2.data.is_goal:
+            return np.inf
+        prm_n1 = n1.data.data
+        prm_n2 = n2.data.data
+        for edge in self.adj_list[prm_n1.id]:
+            if edge.target_id == prm_n2.id:
+                return edge.cost
+        return np.inf
+
+    def is_goal_reached(self, current: AStarData, goal: AStarData):
+        if not current.is_goal and goal.is_goal:
+            return goal.data.contains(current.data.pose[0], current.data.pose[1])
+        return False
 
 
 # TODO: Design PRMVisualizer
@@ -241,13 +310,32 @@ class Firetruck(obs.DrawableGroup):
         if len(self._segment_queue) > 0:
             self._waypoint_queue = self._segment_queue[0].waypoints()
 
+    def replan(self):
+        timer_pairs = [(coords, time) for coords, time in shr.get_burn_timers().items()]
+        timer_pairs.sort(key=lambda pair: pair[1])
+        best = None
+        for timer in timer_pairs:
+            if best is None or timer[1] < best[1] or best[1] < 5 < timer[1]:
+                best = timer
+        if best is not None:
+            print(f'Firetruck pathing to {best[0]} ({best[1]:0.2f}s remaining)')
+            goal = shr.get_ext_region(*best[0])
+            path = self.prm.query((self.x, self.y, self.theta), goal)
+            if path is not None:
+                print(f'Firetruck found path to {best[0]}')
+                self.queue_paths(path)
+            else:
+                print(f'Firetruck pathing failed')
+
     def step(self, dt: float) -> None:
         """
         Advances the vehicle pose along the queued Reeds-Shepp waypoints.
         Moves only the body rectangle as it navigates.
         """
         if len(self._segment_queue) == 0:
-            # TODO plan here
+            self.replan()
+
+        if len(self._segment_queue) == 0:
             return
         segment = self._segment_queue[0]
         seg_len = abs(segment.length)

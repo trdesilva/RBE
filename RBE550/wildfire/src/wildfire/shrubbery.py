@@ -1,3 +1,5 @@
+import functools
+
 import fastquadtree as qt
 import numpy as np
 
@@ -7,6 +9,8 @@ OBS_INTACT = 1
 OBS_BURNING = 2
 OBS_EXT = 3
 OBS_BURNED = 4
+
+EXT_RANGE = ui.meters_to_cells(10)
 
 _state_qts: dict[int, qt.RectQuadTree] = {}
 """
@@ -33,12 +37,38 @@ _burn_timers: dict[tuple[int, int], float] = {}
 Dictionary mapping from (x, y) coordinate pairs for obstacle origins to number of seconds left before the burning state
 transitions to the burned state.
 """
+_obstacle_to_ext_region = {}
+
+class ExtRegion:
+    def __init__(self, obs_origin):
+        self.obs_origin = obs_origin
+        self.verts = set()
+        for tup in _obstacle_to_qttups[self.obs_origin]:
+            for i in [(0, 0), (2, 0), (0, 2), (2, 2)]:
+                self.verts.add((tup[1 + i[0]], tup[2 + i[1]]))
+
+    @functools.lru_cache(maxsize=250)
+    def contains(self, x, y):
+        for v in self.verts:
+            if (v[0] - x) ** 2 + (v[1] - y) ** 2 < EXT_RANGE ** 2:
+                return True
+        return False
+
+    @functools.lru_cache(maxsize=250)
+    def get_minimum_distance(self, x, y):
+        minimum = np.inf
+        for v in self.verts:
+            check = (v[0] - x) ** 2 + (v[1] - y) ** 2
+            if check < minimum:
+                minimum = check
+        return np.sqrt(minimum)
 
 def qt_rect(coord):
     return (coord[0], coord[1], coord[0] + 1, coord[1] + 1)
 
 def init(field_width, field_height, cell_to_obstacle, obstacle_to_cells):
-    global _cell_to_obstacle, _obstacle_to_cells
+    global EXT_RANGE, _cell_to_obstacle, _obstacle_to_cells
+    EXT_RANGE = ui.meters_to_cells(10)
     print('Creating shrubbery quadtrees...')
     _state_qts[OBS_INTACT] = qt.RectQuadTree((0, 0, field_width, field_height),
                                                   int(field_width*field_height*0.1))
@@ -62,6 +92,7 @@ def create_state(x, y):
         rect = qt_rect(coord)
         qttup = (_state_qts[OBS_INTACT].insert(qt_rect(coord)), *rect)
         _obstacle_to_qttups[(x, y)].append(qttup)
+    _obstacle_to_ext_region[(x, y)] = ExtRegion((x, y))
     
 def ignite(x, y):
     state = get_state(x, y)
@@ -138,6 +169,16 @@ def get_burn_timer(x, y):
         elif _obstacle_to_state[obs] == OBS_BURNING or obs in _burn_timers:
             print(f'inconsistent state between _obstacle_to_state and _burn_timers for {obs}')
     return np.inf
+
+def get_burn_timers():
+    return _burn_timers.copy()
+
+def get_ext_region(x, y):
+    if (x, y) in _cell_to_obstacle:
+        obstacle = _cell_to_obstacle[(x, y)]
+        if obstacle in _obstacle_to_ext_region:
+            return _obstacle_to_ext_region[obstacle]
+    return None
 
 def step(dt):
     obs_to_check = set(_burn_timers.keys())
