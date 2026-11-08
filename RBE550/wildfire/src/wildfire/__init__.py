@@ -23,6 +23,12 @@ def main() -> None:
 
     shr.init(obs.FIELD_WIDTH, obs.FIELD_HEIGHT, cell_to_obstacle, obstacle_to_cells)
 
+    for rect in shr.get_all_obstacle_rects():
+        _canvas.add_drawable(rect)
+
+    for region in shr.get_all_ext_regions():
+        _canvas.add_drawable(region)
+
     truck = Firetruck(0.5, 1, np.pi/2, turn_radius=13, obs_quadtree=obs.obs_quadtree)
     wump = Wumpus(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1, obs.FIELD_WIDTH, obs.FIELD_HEIGHT, obs.obs_quadtree)
     _canvas.add_drawable(truck)

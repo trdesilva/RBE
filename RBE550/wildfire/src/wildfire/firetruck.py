@@ -1,4 +1,4 @@
-import astar
+﻿import astar
 import math
 import random
 from dataclasses import dataclass
@@ -180,7 +180,7 @@ class PRMPlanner(AStar):
         step_size: float = 0.1,
         num_samples: int = 100,
         connection_radius: float = 8.0,
-        k_neighbors: int = 6,
+        k_neighbors: int = 10,
     ):
         self.obs_quadtree = obs_quadtree
         self.bounds = bounds  # (min_x, min_y, max_x, max_y)
@@ -307,6 +307,8 @@ class PRMPlanner(AStar):
                     self.adj_list[node.id].append(edge)
                     if self.visualizer is not None:
                         self.visualizer.add_edge(edge, strip)
+            if (i + 1) % (self.num_samples / 100) < 1:
+                self.visualizer.update_visualization()
             if (i + 1) % (self.num_samples / 10) < 1:
                 print(f'PRM connected {i + 1} nodes')
 
@@ -321,6 +323,8 @@ class PRMPlanner(AStar):
         """
         Connects start_pose to the roadmap and finds an A* path to a vertex within goal_region.
         """
+        if goal_region is None:
+            return None
         if len(self.nodes) == 0:
             self.generate_roadmap()
         nearest_nodes = self.node_quadtree.nearest_neighbors((start_pose[0], start_pose[1]), 20)
@@ -370,7 +374,7 @@ class PRMPlanner(AStar):
         return [AStarData(self.nodes[edge.target_id]) for edge in self.adj_list[prm_node.id]]
 
     def heuristic_cost_estimate(self, current: AStarData, goal: AStarData) -> float:
-        if not current.is_goal and goal.is_goal:
+        if not current.is_goal and goal.is_goal and goal.data is not None:
             result = goal.data.get_minimum_distance(current.data.pose[0], current.data.pose[1])
             if self.visualizer is not None:
                 self.visualizer.update_heuristic_display(current.data.id, result)
@@ -390,7 +394,7 @@ class PRMPlanner(AStar):
         return np.inf
 
     def is_goal_reached(self, current: AStarData, goal: AStarData):
-        if not current.is_goal and goal.is_goal:
+        if not current.is_goal and goal.is_goal and goal.data is not None:
             return goal.data.contains(current.data.pose[0], current.data.pose[1])
         return False
 
@@ -443,9 +447,10 @@ class Firetruck(obs.DrawableGroup):
         self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 25*25, 5, 5)
 
         # Motion execution queue
-        self._segment_queue = []
+        self._path_queue = []
         self._waypoint_queue: List[rsplan.primitives.Waypoint] = []
         self._step_dist = 0
+        self.current_goal: Optional[shr.ExtRegion] = None
 
     def check_collision(self, obs_quadtree: qt.RectQuadTree) -> bool:
         """Tests whether the current body pose collides with the obstacle field."""
@@ -454,9 +459,9 @@ class Firetruck(obs.DrawableGroup):
     def queue_paths(self, paths: List[rsplan.primitives.Path]) -> None:
         """Enqueues waypoints from a sequence of rsplan Paths for navigation."""
         for path in paths:
-            self._segment_queue.extend(path.segments)
-        if len(self._segment_queue) > 0:
-            self._waypoint_queue = self._segment_queue[0].waypoints()
+            self._path_queue.append(path)
+        if len(self._path_queue) > 0:
+            self._waypoint_queue = self._path_queue[0].waypoints()
 
     def replan(self):
         timer_pairs = [(coords, time) for coords, time in shr.get_burn_timers().items()]
@@ -468,35 +473,47 @@ class Firetruck(obs.DrawableGroup):
         if best is not None:
             print(f'Firetruck pathing to {best[0]} ({best[1]:0.2f}s remaining)')
             goal = shr.get_ext_region(*best[0])
+            if goal is None:
+                self.current_goal = None
+                shr.set_current_goal(None)
+                print(f'Firetruck pathing failed: goal ExtRegion is None for {best[0]}')
+                return
             path = self.prm.query((self.x, self.y, self.theta), goal)
             if path is not None:
                 print(f'Firetruck found path to {best[0]}')
+                self.current_goal = goal
+                shr.set_current_goal(goal)
                 self.queue_paths(path)
             else:
+                self.current_goal = None
+                shr.set_current_goal(None)
                 print(f'Firetruck pathing failed')
+        else:
+            self.current_goal = None
+            shr.set_current_goal(None)
 
     def step(self, dt: float) -> None:
         """
         Advances the vehicle pose along the queued Reeds-Shepp waypoints.
         Moves only the body rectangle as it navigates.
         """
-        if len(self._segment_queue) == 0:
+        if len(self._path_queue) == 0:
             self.replan()
 
-        if len(self._segment_queue) == 0:
+        if len(self._path_queue) == 0:
             return
 
         if dt <= 0 or self.speed <= 0 or not self._waypoint_queue:
             return
 
-        segment = self._segment_queue[0]
-        seg_len = abs(segment.length)
-        if seg_len == 0 or len(self._waypoint_queue) == 0:
+        path = self._path_queue[0]
+        path_len = abs(path.total_length)
+        if path_len == 0 or len(self._waypoint_queue) == 0:
             return
 
         distance_to_cover = dt * self.speed
         num_intervals = max(len(self._waypoint_queue) - 1, 1)
-        distance_per_waypoint = seg_len / num_intervals
+        distance_per_waypoint = path_len / num_intervals
         if distance_per_waypoint == 0:
             return
 
@@ -506,39 +523,39 @@ class Firetruck(obs.DrawableGroup):
         while distance_to_cover >= dist_to_next - 1e-9:
             distance_to_cover = max(0.0, distance_to_cover - dist_to_next)
             self._step_dist += dist_to_next
-            if self._step_dist >= seg_len - 1e-9:
-                self._step_dist -= seg_len
+            if self._step_dist >= path_len - 1e-9:
+                self._step_dist -= path_len
                 if self._step_dist < 0:
                     self._step_dist = 0.0
                 last_wp = self._waypoint_queue[-1]
-                self._segment_queue.pop(0)
-                if not self._segment_queue:
+                self._path_queue.pop(0)
+                if not self._path_queue:
                     self._waypoint_queue = []
                     self.set_pose(last_wp.x, last_wp.y, last_wp.yaw)
                     return
-                segment = self._segment_queue[0]
-                self._waypoint_queue = segment.waypoints() if callable(getattr(segment, "waypoints", None)) else getattr(segment, "waypoints", [])
+                path = self._path_queue[0]
+                self._waypoint_queue = path.waypoints()
                 if not self._waypoint_queue:
                     return
-                seg_len = abs(segment.length)
-                if seg_len == 0:
+                path_len = abs(path.total_length)
+                if path_len == 0:
                     return
                 num_intervals = max(len(self._waypoint_queue) - 1, 1)
-                distance_per_waypoint = seg_len / num_intervals
+                distance_per_waypoint = path_len / num_intervals
                 if distance_per_waypoint == 0:
                     return
 
-            segment_progress = self._step_dist / seg_len
-            idx = min(int(segment_progress * num_intervals), len(self._waypoint_queue) - 1)
+            path_progress = self._step_dist / path_len
+            idx = min(int(path_progress * num_intervals), len(self._waypoint_queue) - 1)
             wp = self._waypoint_queue[idx]
             self.set_pose(wp.x, wp.y, wp.yaw)
             dist_to_next = distance_per_waypoint
 
         self._step_dist += distance_to_cover
-        segment_progress = self._step_dist / seg_len
+        path_progress = self._step_dist / path_len
         waypoint_progress = (self._step_dist % distance_per_waypoint) / distance_per_waypoint if distance_per_waypoint > 0 else 0.0
 
-        idx = min(int(segment_progress * num_intervals), len(self._waypoint_queue) - 1)
+        idx = min(int(path_progress * num_intervals), len(self._waypoint_queue) - 1)
         if idx < len(self._waypoint_queue) - 1:
             wp1 = self._waypoint_queue[idx]
             wp2 = self._waypoint_queue[idx + 1]
@@ -550,3 +567,4 @@ class Firetruck(obs.DrawableGroup):
         else:
             wp = self._waypoint_queue[idx]
             self.set_pose(wp.x, wp.y, wp.yaw)
+
