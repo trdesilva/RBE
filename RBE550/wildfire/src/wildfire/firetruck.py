@@ -494,8 +494,9 @@ class PRMPlanner(AStar):
                     segments = edge.path.segments
                     for i in range(1, len(waypoints)):
                         cost += abs(waypoints[i].yaw - waypoints[i - 1].yaw)/(2*len(waypoints))
-                    for i in range(1, len(segments)):
-                        cost *= 1.5 if segments[i].direction != segments[i - 1].direction else 1
+                    for i in range(0, len(segments)):
+                        cost *= 1.2 if segments[i].direction == -1 else 1
+                        cost *= 1.2 if i > 0 and segments[i].direction != segments[i - 1].direction else 1
                     self.visualizer.update_cost_display(edge, edge.cost)
                 return edge.cost
         return np.inf
@@ -554,7 +555,7 @@ class Firetruck(obs.DrawableGroup):
         )
         self.speed = ui.meters_to_cells(speed)
 
-        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, self.speed/(ui.time_rate*ui.fps), 200, 10, 16, 8)
+        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, self.speed/ui.fps, 200, 10, 16, 8)
 
         # Motion execution queue
         self._path_queue = []
@@ -713,6 +714,7 @@ class Firetruck(obs.DrawableGroup):
                     shr.set_current_goal(region)
                     shr.extinguishing_from(self)
                     return True
+        self.current_action = FT_MOVE
         return False
 
     def step(self, dt: float) -> None:

@@ -1,4 +1,6 @@
 import functools
+from dataclasses import dataclass
+from typing import dataclass_transform
 
 import fastquadtree as qt
 import numpy as np
@@ -8,6 +10,13 @@ import valet.grid_sim as ui
 import valet.obstacle_field as obs
 import valet.planner as vp
 import shrubbery as shr
+
+@dataclass
+class AStarData:
+    data: tuple[int, int] | list[tuple[int, int]]
+    is_goal: bool = False
+    def __hash__(self):
+        return hash(list(self.data) if self.is_goal else tuple(self.data)) + 101*hash(self.is_goal)
 
 class Wumpus(obs.DrawableGroup, AStar):
     def __init__(self, x: float, y: float, grid_width: int, grid_height: int, obs_quadtree: qt.RectQuadTree, wumpus_grid_res: int = 3, speed: float= 1.0) -> None:
@@ -37,27 +46,48 @@ class Wumpus(obs.DrawableGroup, AStar):
         self.step_timer = 0
         self.step_period = 1./(speed * wumpus_grid_res)
         self.moves = []
+        self.truck = None
 
     def step(self, dt):
         while dt >= self.step_period - self.step_timer:
             dt -= self.step_period - self.step_timer
             self.step_timer = 0
-            self.ignite_neighbors()
             if len(self.moves) == 0:
+                self.ignite_neighbors()
                 self.replan()
             if len(self.moves) > 0:
                 move = self.moves.pop(0)
                 self.x = move[0]
                 self.y = move[1]
 
-        self.ignite_neighbors()
         self.step_timer += dt
 
     def replan(self):
+        burnables = shr.nearest_neighbors(self.x, self.y, shr.OBS_INTACT, 3)
+        burnables.extend(shr.nearest_neighbors(self.x, self.y, shr.OBS_EXT, 3))
+        goal = []
+        best = None
+        for tup in burnables:
+            cells = [(self.wumpus_grid_res * cell[0] + i, self.wumpus_grid_res * cell[1] + j)
+                     for i in range(self.wumpus_grid_res)
+                     for j in range(self.wumpus_grid_res)
+                     for cell in shr._obstacle_to_cells[shr.resolve_obstacle_origin(tup[1], tup[2])] ]
+            heur = self.heuristic_cost_estimate(AStarData((int(self.x * self.wumpus_grid_res),
+                                                           int(self.y * self.wumpus_grid_res))),
+                                                AStarData(cells, True))
+            if self.truck is not None:
+                heur -= 2*self.heuristic_cost_estimate(AStarData((int(self.truck.x * self.wumpus_grid_res),
+                                                                  int(self.truck.y * self.wumpus_grid_res))),
+                                                       AStarData(cells, True))
+            if best is None or heur < best[1]:
+                best = (cells, heur)
+
+        if best is not None:
+            goal = best[0]
         scaled_start = int(self.x * self.wumpus_grid_res), int(self.y * self.wumpus_grid_res)
-        path = self.astar(scaled_start, (0, 0))
+        path = self.astar(AStarData(scaled_start), AStarData(goal if not len(goal) == 0 else [(0, 0)], True))
         if path is not None:
-            self.moves = (np.array(list(path))/self.wumpus_grid_res).tolist()
+            self.moves = (np.array([i.data for i in list(path)])/self.wumpus_grid_res).tolist()
         else:
             print(f'wumpus failed to path')
 
@@ -83,21 +113,35 @@ class Wumpus(obs.DrawableGroup, AStar):
     A* Impl
     """
     def neighbors(self, node):
+        if node.is_goal:
+            return []
         result = []
         for i in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            neighbor = (node[0] + i[0], node[1] + i[1])
+            neighbor = (node.data[0] + i[0], node.data[1] + i[1])
             if self.check_collision(neighbor):
                 continue
-            result.append(neighbor)
+            result.append(AStarData(neighbor))
         return result
 
     def heuristic_cost_estimate(self, current: T, goal: T) -> float:
-        return abs(goal[0] - current[0]) + abs(goal[1] - current[1])
+        min_heur = np.inf
+        if not current.is_goal and goal.is_goal and goal.data is not None:
+            c = current.data
+            for g in goal.data:
+                min_heur = min(abs(g[0] - c[0]) + abs(g[1] - c[1]), min_heur)
+        return min_heur
 
-    def path_distance_between(self, n1: SearchNode[T], n2: SearchNode[T]) -> float:
+    def distance_between(self, n1: T, n2: T) -> float:
+        if n1.is_goal or n2.is_goal:
+            return np.inf
         if self.check_collision(n2.data):
             return np.inf
         return abs(n2.data[0] - n1.data[0]) + abs(n2.data[1] - n1.data[1])
 
     def is_goal_reached(self, current, goal):
-        return goal[0] == current[0] and goal[1] == current[1]
+        if not current.is_goal and goal.is_goal and goal.data is not None:
+            c = current.data
+            for g in goal.data:
+                if abs(g[0] - c[0]) + abs(g[1] - c[1]) <= 1:
+                    return True
+        return False

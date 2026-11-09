@@ -34,6 +34,7 @@ def main() -> None:
 
     truck = Firetruck(0.5, 1, np.pi/2, turn_radius=13, obs_quadtree=obs.obs_quadtree)
     wump = Wumpus(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1, obs.FIELD_WIDTH, obs.FIELD_HEIGHT, obs.obs_quadtree)
+    wump.truck = truck
     _canvas.add_drawable(truck)
     _canvas.add_drawable(wump)
     if truck.default_goal is not None:
