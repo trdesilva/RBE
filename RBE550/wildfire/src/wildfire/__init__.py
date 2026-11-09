@@ -4,10 +4,12 @@ import csv
 import datetime
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+from pathlib import Path
 
 import numpy as np
 import fastquadtree as qt
@@ -16,9 +18,22 @@ import valet.obstacle_field as obs
 import valet.grid_sim as ui
 import valet.planner as plan
 
+# Ensure the wildfire package directory is on sys.path so intra-package modules
+# (firetruck, wumpus, shrubbery) are resolved from the exact same top-level namespace.
+_pkg_dir = str(Path(__file__).parent.resolve())
+if _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
+
 from firetruck import Firetruck
 from wumpus import Wumpus
 import shrubbery as shr
+
+# Alias in sys.modules so imports referencing wildfire.* point to the exact same module instances
+sys.modules.setdefault('wildfire.shrubbery', shr)
+sys.modules.setdefault('wildfire.firetruck', sys.modules['firetruck'])
+sys.modules.setdefault('wildfire.wumpus', sys.modules['wumpus'])
+
+__all__ = ["main", "Firetruck", "Wumpus", "shr"]
 
 sim_time = 0.0
 firetruck_cumulative_cpu_time = 0.0
