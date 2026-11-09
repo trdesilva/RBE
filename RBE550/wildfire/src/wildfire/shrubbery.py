@@ -171,13 +171,110 @@ class ExtRegion(obs.DrawableGroup):
         return (np.inf, np.inf)
 
 
-def set_current_goal(goal: ExtRegion | None):
+class SimpleGoalRegion(obs.DrawableRect):
+    """
+    A goal region not associated with an obstacle, providing a default goal behavior
+    (e.g., pathing to the center of the map) for Firetruck.
+    Conforms to the goal interface required by firetruck.py:
+    contains, get_minimum_distance, get_timers, update_visualization, verts, obs_origin, __hash__.
+    """
+    def __init__(
+        self,
+        x: float,
+        y: float,
+        width: float = 4.0,
+        height: float = 4.0,
+        theta: float = 0.0,
+        origin: tuple[float, float] = (0.5, 0.5),
+        coordinate_frame: str = "grid",
+        visible: bool = False,
+    ):
+        super().__init__(
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            theta=theta,
+            origin=origin,
+            fill_color=EXT_COLOR_GOAL,
+            border_color=None,
+            border_width=0.0,
+            coordinate_frame=coordinate_frame,
+            visible=visible,
+        )
+        self.obs_origin = None
+
+    def update_visualization(self, is_goal: bool = False):
+        if is_goal:
+            self.visible = True
+            self.fill_color = EXT_COLOR_GOAL
+        else:
+            self.visible = False
+
+    @property
+    def verts(self) -> set[tuple[float, float]]:
+        w = self.get_world_vertices()
+        v = {(float(w[0, i]), float(w[1, i])) for i in range(4)}
+        v.add((float(self.x), float(self.y)))
+        return v
+
+    def contains(self, x: float, y: float) -> bool:
+        c = np.cos(-self.theta)
+        s = np.sin(-self.theta)
+        dx = x - self.x
+        dy = y - self.y
+        lx = c * dx - s * dy
+        ly = s * dx + c * dy
+        ox, oy = self.origin
+        x0 = -ox * self.width
+        x1 = (1.0 - ox) * self.width
+        y0 = -oy * self.height
+        y1 = (1.0 - oy) * self.height
+        return (x0 <= lx <= x1) and (y0 <= ly <= y1)
+
+    def get_minimum_distance(self, x: float, y: float) -> tuple[float, tuple[float, float]]:
+        """
+        :param x: x to measure from
+        :param y: y to measure from
+        :return: Tuple of (minimum_distance_to, goal_vertex)
+        """
+        minimum = np.inf
+        min_vert = None
+        for v in self.verts:
+            check = (v[0] - x) ** 2 + (v[1] - y) ** 2
+            if check < minimum:
+                minimum = check
+                min_vert = v
+        if min_vert is None:
+            min_vert = (float(self.x), float(self.y))
+            minimum = (self.x - x) ** 2 + (self.y - y) ** 2
+        return float(np.sqrt(minimum)), min_vert
+
+    def get_timers(self) -> tuple[float, float]:
+        """
+        Returns (-1.0, -1.0) so neither burn nor extinguish conditions are met.
+        """
+        return (-1.0, -1.0)
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __repr__(self) -> str:
+        return f"SimpleGoalRegion(x={self.x}, y={self.y}, w={self.width}, h={self.height})"
+
+
+def set_current_goal(goal: ExtRegion | SimpleGoalRegion | None):
     global _current_goal
+    if _current_goal is not None and _current_goal is not goal and hasattr(_current_goal, 'update_visualization'):
+        _current_goal.update_visualization(False)
     _current_goal = goal
     update_ext_regions()
 
 
-def get_current_goal() -> ExtRegion | None:
+def get_current_goal() -> ExtRegion | SimpleGoalRegion | None:
     return _current_goal
 
 
@@ -188,6 +285,8 @@ def update_ext_regions():
             and (_current_goal is region or getattr(_current_goal, 'obs_origin', None) == origin)
         )
         region.update_visualization(is_goal)
+    if _current_goal is not None and hasattr(_current_goal, 'update_visualization'):
+        _current_goal.update_visualization(True)
 
 
 def resolve_obstacle_origin(x: int, y: int) -> tuple[int, int] | None:
@@ -398,6 +497,14 @@ def get_burn_timer(x, y):
 
 def get_burn_timers():
     return _burn_timers.copy()
+
+
+def has_extinguishable_fires() -> bool:
+    """Returns True if there is at least one burning obstacle with burn_timer > ext_timer."""
+    for origin, burn_time in _burn_timers.items():
+        if burn_time > _ext_timers.get(origin, np.inf):
+            return True
+    return False
 
 
 def get_ext_region(x, y):

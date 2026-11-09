@@ -10,7 +10,7 @@ import valet.planner as vp
 import shrubbery as shr
 
 class Wumpus(obs.DrawableGroup, AStar):
-    def __init__(self, x: float, y: float, grid_width: int, grid_height: int, obs_quadtree: qt.RectQuadTree, wumpus_grid_res: int = 3, speed: float= 2.0) -> None:
+    def __init__(self, x: float, y: float, grid_width: int, grid_height: int, obs_quadtree: qt.RectQuadTree, wumpus_grid_res: int = 3, speed: float= 1.0) -> None:
         """
         The Wumpus takes up a cell in a grid with wumpus_grid_res times higher linear resolution than the global grid.
         It plans its movement using A* in this finer grid and maps obstacles from obs_quadtree into it.

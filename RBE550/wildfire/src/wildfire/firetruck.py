@@ -37,7 +37,7 @@ class PRMEdge:
 
 @dataclass
 class AStarData:
-    data: PRMNode|shr.ExtRegion
+    data: PRMNode | shr.ExtRegion | shr.SimpleGoalRegion
     is_goal: bool = False
     def __hash__(self) -> int:
         return hash(self.data) + 101*hash(self.is_goal)
@@ -390,7 +390,8 @@ class PRMPlanner(AStar):
         self.sample_uniform_nodes(target_count=int(self.num_samples/self.sample_dist_ratio))
 
         # Second half: Gaussian sampler near obstacles
-        self.sample_gaussian_nodes(target_count=self.num_samples)
+        while len(self.nodes) < self.num_samples:
+            self.sample_gaussian_nodes(target_count=self.num_samples)
 
         # Step 2 & 3: Connect k-nearest neighbors with Reeds-Shepp paths
         print(f'PRM connecting {len(self.nodes)} nodes...')
@@ -408,13 +409,15 @@ class PRMPlanner(AStar):
     def query(
         self,
         start_pose: Tuple[float, float, float],
-        goal_region: shr.ExtRegion,
+        goal_region: shr.ExtRegion | shr.SimpleGoalRegion,
     ) -> Optional[List[rsplan.primitives.Path]]:
         """
         Connects start_pose to the roadmap and finds an A* path to a vertex within goal_region.
         """
         if goal_region is None:
             return None
+        if goal_region.contains(start_pose[0], start_pose[1]):
+            return []
         if len(self.nodes) == 0:
             self.generate_roadmap()
 
@@ -447,7 +450,7 @@ class PRMPlanner(AStar):
                     self.visualizer.update_visualization()
                 return path
             else:
-                print(f'ExtRegion {goal_region} is not reachable from {start_pose}.')
+                print(f'Goal region {goal_region} is not reachable from {start_pose}.')
                 return None
         else:
             print(f'No valid connections found for {start_pose}')
@@ -468,7 +471,7 @@ class PRMPlanner(AStar):
             gx, gy = goal_vert
             cx, cy, ctheta = current.data.pose
             max_dist_to_goal = float(np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2))
-            xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal
+            xy_progress = abs(max_dist_to_goal - dist_to_goal) / max_dist_to_goal if max_dist_to_goal > 0 else 0.0
             angle_to_goal = np.atan2(gy - cx, gx - cy)
             # prefer pointing at goal when far away and being parallel with goal when close
             heading_heur = (1 - xy_progress) * angle_to_goal + xy_progress * (np.sin(abs(ctheta)))
@@ -520,8 +523,9 @@ class Firetruck(obs.DrawableGroup):
         width: float = 2.2,
         wheelbase: float = 3.0,
         turn_radius: Optional[float] = None,
-        speed: float = 10,
-        obs_quadtree: qt.RectQuadTree|None = None
+        speed: float = 10.,
+        obs_quadtree: qt.RectQuadTree|None = None,
+        default_goal: Optional[shr.SimpleGoalRegion] = None,
     ):
         super().__init__(x, y, theta)
 
@@ -550,14 +554,33 @@ class Firetruck(obs.DrawableGroup):
         )
         self.speed = ui.meters_to_cells(speed)
 
-        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 200, 10, 16, 8)
+        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, self.speed/(ui.time_rate*ui.fps), 200, 10, 16, 8)
 
         # Motion execution queue
         self._path_queue = []
         self._waypoint_queue: List[rsplan.primitives.Waypoint] = []
         self._step_dist = 0
-        self.current_goal: Optional[shr.ExtRegion] = None
+        self.current_goal: Optional[shr.ExtRegion | shr.SimpleGoalRegion] = None
         self.current_action = FT_MOVE
+
+        if default_goal is not None:
+            self.default_goal: Optional[shr.SimpleGoalRegion] = default_goal
+        else:
+            cx = 12.5
+            cy = 12.5
+            if obs_quadtree is not None and hasattr(obs_quadtree, 'bbox'):
+                bx0, by0, bx1, by1 = obs_quadtree.bbox
+                cx = (bx0 + bx1) / 2.0
+                cy = (by0 + by1) / 2.0
+            elif hasattr(obs, 'FIELD_WIDTH') and hasattr(obs, 'FIELD_HEIGHT'):
+                cx = float(obs.FIELD_WIDTH) / 2.0
+                cy = float(obs.FIELD_HEIGHT) / 2.0
+            self.default_goal = shr.SimpleGoalRegion(cx, cy, width=4.0, height=4.0)
+
+        canvas = obs._active_widget
+        if canvas is not None and getattr(canvas, 'drawables', None) is not None:
+            if self.default_goal not in canvas.drawables:
+                canvas.add_drawable(self.default_goal)
 
     def check_collision(self, obs_quadtree: qt.RectQuadTree) -> bool:
         """Tests whether the current body pose collides with the obstacle field."""
@@ -636,7 +659,34 @@ class Firetruck(obs.DrawableGroup):
                 shr.set_current_goal(None)
                 self.clear_motion_queue()
                 print(f'Firetruck pathing failed')
-        # TODO go to middle
+
+        # If there's no burning goal, drive to default goal (middle of map)
+        if self.default_goal is not None:
+            if self.default_goal.contains(self.x, self.y):
+                self.current_goal = self.default_goal
+                shr.set_current_goal(self.default_goal)
+                self.current_action = FT_MOVE
+                self.clear_motion_queue()
+                return
+            if self.current_goal is self.default_goal and len(self._path_queue) > 0:
+                return
+            path = self.prm.query((self.x, self.y, self.theta), self.default_goal)
+            if path is not None and len(path) == 0:
+                self.current_goal = self.default_goal
+                shr.set_current_goal(self.default_goal)
+                self.current_action = FT_MOVE
+                self.clear_motion_queue()
+                return
+            elif path is not None and len(path) > 0:
+                print(f'Firetruck pathing to default goal')
+                self.current_goal = self.default_goal
+                shr.set_current_goal(self.default_goal)
+                self.queue_paths(path, clear_queue=True)
+                self.current_action = FT_MOVE
+                return
+            else:
+                print(f'Firetruck pathing to default goal failed')
+
         self.current_goal = None
         shr.set_current_goal(None)
         self.clear_motion_queue()
@@ -677,7 +727,21 @@ class Firetruck(obs.DrawableGroup):
             return
 
         goal_burn, goal_ext = self.current_goal.get_timers() if self.current_goal is not None else (0, 0)
-        if len(self._path_queue) == 0 or self.current_goal is None or goal_burn == np.inf or goal_burn < goal_ext:
+        is_default_goal = isinstance(self.current_goal, shr.SimpleGoalRegion)
+        has_fires = shr.has_extinguishable_fires() if hasattr(shr, 'has_extinguishable_fires') else any(
+            region.get_timers()[0] > region.get_timers()[1]
+            for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 100)
+            if (region := shr.get_ext_region(cell_tup[1], cell_tup[2])) is not None
+        )
+        at_default = is_default_goal and self.current_goal.contains(self.x, self.y)
+
+        should_replan = (
+            self.current_goal is None
+            or (is_default_goal and has_fires)
+            or (not is_default_goal and (goal_burn == np.inf or goal_burn < goal_ext))
+            or (len(self._path_queue) == 0 and not at_default)
+        )
+        if should_replan:
             self.replan()
 
         if self.current_action == FT_EXT and self.try_extinguish(): # check again after replanning

@@ -36,6 +36,8 @@ def main() -> None:
     wump = Wumpus(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1, obs.FIELD_WIDTH, obs.FIELD_HEIGHT, obs.obs_quadtree)
     _canvas.add_drawable(truck)
     _canvas.add_drawable(wump)
+    if truck.default_goal is not None:
+        _canvas.add_drawable(truck.default_goal)
 
     truck.prm.visualizer.canvas = _canvas
     ui.checkbox_toggle_callback = truck.prm.visualizer.update_visualization

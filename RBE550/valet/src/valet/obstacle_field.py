@@ -506,10 +506,12 @@ class DrawableRect(TF2DOwner):
         """
         world_verts = self.get_world_vertices()
         # world_verts has shape (2, 4): row 0 is x, row 1 is y
-        minx = np.min(world_verts[0, :])
-        miny = np.min(world_verts[1, :])
-        maxx = np.max(world_verts[0, :])
-        maxy = np.max(world_verts[1, :])
+        w0 = world_verts[0]
+        w1 = world_verts[1]
+        minx = min(w0[0], w0[1], w0[2], w0[3])
+        miny = min(w1[0], w1[1], w1[2], w1[3])
+        maxx = max(w0[0], w0[1], w0[2], w0[3])
+        maxy = max(w1[0], w1[1], w1[2], w1[3])
         # fastquadtree convention (minx, miny, maxx, maxy), else two column vectors
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 

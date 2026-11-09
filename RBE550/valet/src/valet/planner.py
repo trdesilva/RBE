@@ -895,42 +895,104 @@ class Car(Vehicle, metaclass=_CarMeta):
 
 def check_collision(body: obs.DrawableRect, obs_quadtree: qt.RectQuadTree):
     body_verts = body.get_world_vertices()
-    body_aabb = body.get_aabb()
-    # expand body_aabb by 1 cell because rectquadtree.query returns rectangles with a VERTEX in the query,
-    # not intersections
-    query_aabb = (body_aabb[0] - 0.5, body_aabb[1] - 0.5, body_aabb[2] + 0.5, body_aabb[3] + 0.5)
-    nearest_cells = obs_quadtree.query(query_aabb)
-    verts_oob_count = 0
-    for i in range(body_verts.shape[1]):
-        if not(0 <= body_verts[0, i] <= obs.FIELD_WIDTH and 0 <= body_verts[1, i] <= obs.FIELD_HEIGHT):
-            verts_oob_count += 1
+    bx0, bx1, bx2, bx3 = body_verts[0, 0], body_verts[0, 1], body_verts[0, 2], body_verts[0, 3]
+    by0, by1, by2, by3 = body_verts[1, 0], body_verts[1, 1], body_verts[1, 2], body_verts[1, 3]
+
+    verts_oob_count = (
+        (not (0 <= bx0 <= obs.FIELD_WIDTH and 0 <= by0 <= obs.FIELD_HEIGHT)) +
+        (not (0 <= bx1 <= obs.FIELD_WIDTH and 0 <= by1 <= obs.FIELD_HEIGHT)) +
+        (not (0 <= bx2 <= obs.FIELD_WIDTH and 0 <= by2 <= obs.FIELD_HEIGHT)) +
+        (not (0 <= bx3 <= obs.FIELD_WIDTH and 0 <= by3 <= obs.FIELD_HEIGHT))
+    )
     if verts_oob_count >= 4:
         return True # Vehicle has entirely left the map
 
+    b_minx = min(bx0, bx1, bx2, bx3)
+    b_maxx = max(bx0, bx1, bx2, bx3)
+    b_miny = min(by0, by1, by2, by3)
+    b_maxy = max(by0, by1, by2, by3)
+
+    # expand body_aabb by 0.5 cells because rectquadtree.query returns rectangles with a VERTEX in the query,
+    # not intersections
+    query_aabb = (b_minx - 0.5, b_miny - 0.5, b_maxx + 0.5, b_maxy + 0.5)
+    nearest_cells = obs_quadtree.query(query_aabb)
+    if not nearest_cells:
+        return False
+
+    cand_cells = []
     for cell in nearest_cells:
         # query returns (id, minx, miny, maxx, maxy)
         # check if corners of the cell are in the body or vice versa
-        minx = cell[1]
-        miny = cell[2]
-        maxx = cell[3]
-        maxy = cell[4]
-        cell_verts_inside = np.zeros((4,4), dtype=bool)
-
-        for i in range(4):
-            bv = body_verts[:, i]
-            if minx <= bv[0] <= maxx and miny <= bv[1] <= maxy:
+        c_minx, c_miny, c_maxx, c_maxy = cell[1], cell[2], cell[3], cell[4]
+        # Fast AABB pre-filter: discard cells whose AABB does not overlap body AABB
+        if not (c_maxx < b_minx or c_minx > b_maxx or c_maxy < b_miny or c_miny > b_maxy):
+            if ((c_minx <= bx0 <= c_maxx and c_miny <= by0 <= c_maxy) or
+                (c_minx <= bx1 <= c_maxx and c_miny <= by1 <= c_maxy) or
+                (c_minx <= bx2 <= c_maxx and c_miny <= by2 <= c_maxy) or
+                (c_minx <= bx3 <= c_maxx and c_miny <= by3 <= c_maxy)):
                 # body corner inside cell
                 return True
-            bv_next = body_verts[:, (i + 1) % 4]
-            # check all cell vertices for being to the left of edge (bv, bv_next)
-            for j in range(4):
-                cell_vert = np.array([cell[2*int(j/2) + 1], cell[2*(j % 2) + 2]]).T
-                cell_verts_inside[i, j] = np.linalg.det(np.vstack((np.column_stack((bv, bv_next, cell_vert)),
-                                                                  np.ones((1, 3))))) <= 0
+            cand_cells.append((c_minx, c_miny, c_maxx, c_maxy))
 
-        # if any cell vertex is inside (left of) all body edges
-        if np.any(np.all(cell_verts_inside, axis=0)):
-            return True
+    if not cand_cells:
+        return False
+
+    # Directed edge vectors for the 4 body edges: dx = x2 - x1, dy = y2 - y1
+    dx0, dy0 = bx1 - bx0, by1 - by0
+    dx1, dy1 = bx2 - bx1, by2 - by1
+    dx2, dy2 = bx3 - bx2, by3 - by2
+    dx3, dy3 = bx0 - bx3, by0 - by3
+
+    # Check if any cell vertex is inside (left of) all body edges.
+    # The 3x3 homogeneous matrix determinant:
+    #   det([[x1, x2, x3], [y1, y2, y3], [1, 1, 1]]) <= 0
+    # algebraically simplifies to the 2D cross-product:
+    #   dx * (y3 - y1) - dy * (x3 - x1) <= 0
+    # Short-circuiting: a corner must be <= 0 across ALL 4 edges. If any edge > 0, skip to next corner.
+    for c_minx, c_miny, c_maxx, c_maxy in cand_cells:
+        # Corner 0: (c_minx, c_miny)
+        rx0, ry0 = c_minx - bx0, c_miny - by0
+        if dx0 * ry0 - dy0 * rx0 <= 0:
+            rx1, ry1 = c_minx - bx1, c_miny - by1
+            if dx1 * ry1 - dy1 * rx1 <= 0:
+                rx2, ry2 = c_minx - bx2, c_miny - by2
+                if dx2 * ry2 - dy2 * rx2 <= 0:
+                    rx3, ry3 = c_minx - bx3, c_miny - by3
+                    if dx3 * ry3 - dy3 * rx3 <= 0:
+                        return True
+
+        # Corner 1: (c_minx, c_maxy)
+        rx0, ry0 = c_minx - bx0, c_maxy - by0
+        if dx0 * ry0 - dy0 * rx0 <= 0:
+            rx1, ry1 = c_minx - bx1, c_maxy - by1
+            if dx1 * ry1 - dy1 * rx1 <= 0:
+                rx2, ry2 = c_minx - bx2, c_maxy - by2
+                if dx2 * ry2 - dy2 * rx2 <= 0:
+                    rx3, ry3 = c_minx - bx3, c_maxy - by3
+                    if dx3 * ry3 - dy3 * rx3 <= 0:
+                        return True
+
+        # Corner 2: (c_maxx, c_miny)
+        rx0, ry0 = c_maxx - bx0, c_miny - by0
+        if dx0 * ry0 - dy0 * rx0 <= 0:
+            rx1, ry1 = c_maxx - bx1, c_miny - by1
+            if dx1 * ry1 - dy1 * rx1 <= 0:
+                rx2, ry2 = c_maxx - bx2, c_miny - by2
+                if dx2 * ry2 - dy2 * rx2 <= 0:
+                    rx3, ry3 = c_maxx - bx3, c_miny - by3
+                    if dx3 * ry3 - dy3 * rx3 <= 0:
+                        return True
+
+        # Corner 3: (c_maxx, c_maxy)
+        rx0, ry0 = c_maxx - bx0, c_maxy - by0
+        if dx0 * ry0 - dy0 * rx0 <= 0:
+            rx1, ry1 = c_maxx - bx1, c_maxy - by1
+            if dx1 * ry1 - dy1 * rx1 <= 0:
+                rx2, ry2 = c_maxx - bx2, c_maxy - by2
+                if dx2 * ry2 - dy2 * rx2 <= 0:
+                    rx3, ry3 = c_maxx - bx3, c_maxy - by3
+                    if dx3 * ry3 - dy3 * rx3 <= 0:
+                        return True
 
     return False
 
