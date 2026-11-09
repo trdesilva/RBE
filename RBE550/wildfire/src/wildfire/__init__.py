@@ -23,7 +23,7 @@ import shrubbery as shr
 sim_time = 0.0
 firetruck_cumulative_cpu_time = 0.0
 wumpus_cumulative_cpu_time = 0.0
-
+last_log_time = -np.inf
 
 class CSVStatsLogger:
     """
@@ -85,7 +85,7 @@ def main() -> None:
     obs._cell_width = 25
     obs._cell_height = 25
     ui.METERS_PER_CELL = 5.
-    ui.time_rate = 10.
+    ui.time_rate = 8.
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
     truck_spawn_cells = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]
@@ -151,7 +151,16 @@ def main() -> None:
     wumpus_score_entry.grid(row=1, column=3, padx=5, pady=2, sticky='w')
 
     def step_time_callback():
-        global sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time
+        global sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time, last_log_time
+        if sim_time >= 3600:
+            proc_time = time.perf_counter()
+            csv_logger.log(proc_time, sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time)
+            last_log_time = sim_time
+            print(f'Simulation ended at {sim_time}; A WINNER IS {"WUMPUS" if shr._wumpus_score > shr._firetruck_score else
+            "FIRETRUCK" if shr._firetruck_score > shr._wumpus_score else
+            "YOU?" }')
+            ui._current_time_rate = 0
+
         dt = ui.time_rate / ui.fps
         sim_time += dt
 
@@ -180,8 +189,10 @@ def main() -> None:
         shr.step(dt)
 
         # Log statistics to background thread
-        proc_time = time.perf_counter()
-        csv_logger.log(proc_time, sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time)
+        if sim_time - 10 > last_log_time:
+            proc_time = time.perf_counter()
+            csv_logger.log(proc_time, sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time)
+            last_log_time = sim_time
 
         # Update UI statistics textboxes
         sim_time_var.set(f"{sim_time:.2f} s")

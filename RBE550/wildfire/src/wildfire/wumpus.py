@@ -85,7 +85,7 @@ class Wumpus(obs.DrawableGroup, AStar):
         if best is not None:
             goal = best[0]
         scaled_start = (int(round(self.x * self.wumpus_grid_res)), int(round(self.y * self.wumpus_grid_res)))
-        path = self.astar(AStarData(scaled_start), AStarData(goal if not len(goal) == 0 else [(0, 0)], True))
+        path = self.astar(AStarData(scaled_start), AStarData(goal if not len(goal) == 0 else [scaled_start], True))
         if path is not None:
             nodes = [i.data for i in list(path)]
             if len(nodes) > 1 and nodes[0] == scaled_start:

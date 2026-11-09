@@ -598,7 +598,7 @@ class Firetruck(obs.DrawableGroup):
         )
         self.speed = ui.meters_to_cells(speed)
 
-        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, self.speed/ui.fps, 200, 10, 16, 8)
+        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, self.speed/ui.fps, 200, 12, 16, 10)
 
         # Motion execution queue
         self._path_queue = []
@@ -692,7 +692,8 @@ class Firetruck(obs.DrawableGroup):
             if getattr(region, 'obs_origin', None) is not None and shr.get_state(*region.obs_origin) != shr.OBS_BURNING:
                 continue
             timers = region.get_timers()
-            if timers[0] <= timers[1]:
+            time_left = timers[0] - timers[1]
+            if time_left <= 0:
                 continue
             if region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10):
                 best = region
@@ -705,13 +706,14 @@ class Firetruck(obs.DrawableGroup):
                 checked_edges[region] = list(getattr(self.prm, 'last_optimal_edges', []))
                 if path_candidate is not None:
                     cand_cost = sum(p.total_length for p in path_candidate)
-                    if best is None or checked_regions.get(best) is None:
+                    if cand_cost/self.speed < time_left and best is None or checked_regions.get(best) is None:
                         best = region
-                    else:
+                    elif cand_cost/self.speed < time_left:
                         best_cost = sum(p.total_length for p in checked_regions[best])
                         if cand_cost < best_cost:
                             best = region
-
+                    else:
+                        print(f'Firetruck is too late to save {region}')
         if best is not None and checked_regions.get(best) is not None:
             path = checked_regions[best]
             edges = checked_edges.get(best, [])
