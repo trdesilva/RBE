@@ -563,15 +563,22 @@ class Firetruck(obs.DrawableGroup):
         """Tests whether the current body pose collides with the obstacle field."""
         return vp.check_collision(self.body, obs_quadtree)
 
-    def queue_paths(self, paths: List[rsplan.primitives.Path], clear_queue = True) -> None:
+    def clear_motion_queue(self) -> None:
+        """Clears all queued paths, waypoints, and resets accumulated step distance."""
+        self._path_queue.clear()
+        self._waypoint_queue.clear()
+        self._step_dist = 0.0
+
+    def queue_paths(self, paths: List[rsplan.primitives.Path], clear_queue: bool = True) -> None:
         """Enqueues waypoints from a sequence of rsplan Paths for navigation."""
         if clear_queue:
-            self._path_queue.clear()
-            self._waypoint_queue.clear()
+            self.clear_motion_queue()
         for path in paths:
             self._path_queue.append(path)
-        if len(self._path_queue) > 0:
+        if len(self._path_queue) > 0 and (clear_queue or len(self._waypoint_queue) == 0):
             self._waypoint_queue = self._path_queue[0].waypoints()
+            if clear_queue:
+                self._step_dist = 0.0
 
     def replan(self):
         """
@@ -597,10 +604,16 @@ class Firetruck(obs.DrawableGroup):
                 checked_regions[region] = []
                 break
             elif region.get_timers()[0] > region.get_timers()[1]:
-                checked_regions[region] = self.prm.query((self.x, self.y, self.theta), region)
-                if best is None or (sum([p.total_length for p in checked_regions[region]])
-                                    < sum([p.total_length for p in checked_regions[best]])):
-                    best = region
+                path_candidate = self.prm.query((self.x, self.y, self.theta), region)
+                checked_regions[region] = path_candidate
+                if path_candidate is not None:
+                    cand_cost = sum(p.total_length for p in path_candidate)
+                    if best is None or checked_regions.get(best) is None:
+                        best = region
+                    else:
+                        best_cost = sum(p.total_length for p in checked_regions[best])
+                        if cand_cost < best_cost:
+                            best = region
 
         if best is not None:
             print(f'Firetruck pathing to {best.obs_origin} ({best.get_timers()[0]:0.2f}s remaining)')
@@ -609,21 +622,24 @@ class Firetruck(obs.DrawableGroup):
                 self.current_goal = best
                 shr.set_current_goal(best)
                 self.current_action = FT_EXT
+                self.clear_motion_queue()
                 return
             elif path is not None and len(path) > 0:
                 print(f'Firetruck found path to {best}')
                 self.current_goal = best
                 shr.set_current_goal(best)
-                self.queue_paths(path)
+                self.queue_paths(path, clear_queue=True)
                 self.current_action = FT_MOVE
                 return
             else:
                 self.current_goal = None
                 shr.set_current_goal(None)
+                self.clear_motion_queue()
                 print(f'Firetruck pathing failed')
         # TODO go to middle
         self.current_goal = None
         shr.set_current_goal(None)
+        self.clear_motion_queue()
 
     def try_extinguish(self):
         """
@@ -660,7 +676,8 @@ class Firetruck(obs.DrawableGroup):
         if self.current_action == FT_EXT and self.try_extinguish():
             return
 
-        if len(self._path_queue) == 0 or self.current_goal is None or self.current_goal.get_timers()[0] < self.current_goal.get_timers()[1]:
+        goal_burn, goal_ext = self.current_goal.get_timers() if self.current_goal is not None else (0, 0)
+        if len(self._path_queue) == 0 or self.current_goal is None or goal_burn == np.inf or goal_burn < goal_ext:
             self.replan()
 
         if self.current_action == FT_EXT and self.try_extinguish(): # check again after replanning
@@ -694,6 +711,7 @@ class Firetruck(obs.DrawableGroup):
                 self._path_queue.pop(0)
                 if not self._path_queue:
                     self._waypoint_queue = []
+                    self._step_dist = 0.0
                     self.set_pose(last_wp.x, last_wp.y, last_wp.yaw)
                     return
                 path = self._path_queue[0]

@@ -1386,20 +1386,31 @@ def _sync_grid_colors_from_cells():
                 _grid_colors[y, x] = convert_text_to_rgb(_fill_func(row[x]))
 
 
-def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
+def populate_cells(
+    coverage: float,
+    use_all_tets: bool = True,
+    canvas=None,
+    blocked_cells: list[tuple[int, int]] | set[tuple[int, int]] | None = None,
+):
     """
     :param coverage: approximate percentage of cells that should be occupied, on [0, 1]
     (tetrominoes may overlap so coverage is an upper bound)
     :param use_all_tets: if true, use all possible tetrominoes instead of just the ones on the assignment doc
     :param canvas: the canvas/widget to draw on
+    :param blocked_cells: optional list or set of (x, y) coordinates to consider blocked for tetromino placement
     :return: A dictionary mapping (x, y) coordinate pairs to tetromino cell arrays placed there
     """
     global _cells, _rects, _grid_colors, obs_quadtree
     _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
     _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
+    if obs_quadtree is not None:
+        obs_quadtree.clear()
+    obs_quadtree = qt.RectQuadTree((0, 0, FIELD_WIDTH, FIELD_HEIGHT), 10)
 
     empty_rgb = convert_text_to_rgb(_fill_func([]))
     _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), empty_rgb, dtype=np.uint8)
+
+    blocked_set = {(int(c[0]), int(c[1])) for c in (blocked_cells or ())}
 
     tetrominoes = get_all_tetrominoes() if use_all_tets else get_basic_tetrominoes()
     total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
@@ -1408,22 +1419,46 @@ def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
     cell_to_root = {}
     root_to_cells = {}
     for tet in tets_to_place:
-        tet_cells = tetrominoes[tet]
-        tet_bounds = np.shape(tet_cells)
-        x = _rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
-        y = _rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
-        root_to_cells[(x, y)] = []
-        for i in np.ndindex(tet_bounds):
-            if tet_cells[i] == 1:
-                cy, cx = y + i[0], x + i[1]
-                cell_to_root[(cx, cy)] = (x,y)
-                root_to_cells[(x, y)].append((cx, cy))
-                cell = _cells[cy][cx]
-                if len(cell) > 0:
-                    cell[0] = tet_cells[i]
-                else:
-                    cell.append(tet_cells[i])
-                    obs_quadtree.insert((cx, cy, cx + 1, cy + 1))
+        placed = False
+        candidates = [int(tet)] + [int(_rng.integers(len(tetrominoes))) for _ in range(5)]
+        for candidate_tet in candidates:
+            tet_cells = tetrominoes[candidate_tet]
+            tet_bounds = np.shape(tet_cells)
+            for _ in range(100):
+                x = int(_rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True))
+                y = int(_rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True))
+                if (x, y) in root_to_cells:
+                    continue
+
+                overlap = False
+                cells_for_tet = []
+                for i in np.ndindex(tet_bounds):
+                    if tet_cells[i] == 1:
+                        cy, cx = y + i[0], x + i[1]
+                        if (
+                            (cx, cy) in blocked_set
+                            or (cx, cy) in cell_to_root
+                            or (len(_cells[cy][cx]) > 0 and _cells[cy][cx][0] > 0)
+                        ):
+                            overlap = True
+                            break
+                        cells_for_tet.append((cx, cy, tet_cells[i]))
+
+                if not overlap:
+                    root_to_cells[(x, y)] = []
+                    for cx, cy, val in cells_for_tet:
+                        cell_to_root[(cx, cy)] = (x, y)
+                        root_to_cells[(x, y)].append((cx, cy))
+                        cell = _cells[cy][cx]
+                        if len(cell) > 0:
+                            cell[0] = val
+                        else:
+                            cell.append(val)
+                        obs_quadtree.insert((cx, cy, cx + 1, cy + 1))
+                    placed = True
+                    break
+            if placed:
+                break
 
     # Vectorized color assignment for occupied cells
     wall_rgb = convert_text_to_rgb(_fill_func([1]))

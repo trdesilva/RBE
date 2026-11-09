@@ -19,7 +19,10 @@ def main() -> None:
     ui.METERS_PER_CELL = 5.
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
-    obstacle_to_cells, cell_to_obstacle = obs.populate_cells(0.1, True, _canvas)
+    truck_spawn_cells = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]
+    wumpus_spawn_cells = [(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1)]
+    blocked_cells = truck_spawn_cells + wumpus_spawn_cells
+    obstacle_to_cells, cell_to_obstacle = obs.populate_cells(0.1, True, _canvas, blocked_cells=blocked_cells)
 
     shr.init(obs.FIELD_WIDTH, obs.FIELD_HEIGHT, cell_to_obstacle, obstacle_to_cells)
 
