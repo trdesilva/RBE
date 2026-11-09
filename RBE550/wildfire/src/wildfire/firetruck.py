@@ -1,8 +1,10 @@
-﻿import astar
+from __future__ import annotations
+import astar
 import math
+import time
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import fastquadtree as qt
 import numpy as np
@@ -43,6 +45,20 @@ class AStarData:
         return hash(self.data) + 101*hash(self.is_goal)
 
 
+def timed_visualizer_method(fn):
+    def wrapper(self, *args, **kwargs):
+        t0 = time.perf_counter()
+        is_outer = (self._timing_depth == 0)
+        self._timing_depth += 1
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._timing_depth -= 1
+            if is_outer:
+                self.total_time += time.perf_counter() - t0
+    return wrapper
+
+
 class PRMVisualizer:
     """
     Manages debug visualization of PRM roadmap edges and A* query exploration
@@ -57,7 +73,10 @@ class PRMVisualizer:
         self.optimal_path_edges: Set[PRMEdge] = set()
         self.gradient_values: List[float] = []
         self.value_cache: Optional[np.ndarray] = None
+        self.total_time: float = 0.0
+        self._timing_depth: int = 0
 
+    @timed_visualizer_method
     def add_edge(self, edge: PRMEdge, strip: obs.DrawableLineStrip) -> None:
         """Registers a new roadmap edge and adds its line strip to the canvas."""
         self.edges_with_strips.append(edge)
@@ -66,6 +85,7 @@ class PRMVisualizer:
             if strip not in canvas.drawables:
                 canvas.add_drawable(strip)
 
+    @timed_visualizer_method
     def update_cost_display(self, edge: PRMEdge, cost: float) -> None:
         """Records the cost for an explored edge and updates its visual representation."""
         self.cost_values[edge] = cost
@@ -77,14 +97,24 @@ class PRMVisualizer:
             edge.line_strip.color = self.get_gradient_color(val)
             edge.line_strip.line_width = 1.5
 
+    @timed_visualizer_method
     def update_heuristic_display(self, node_id: int, heur: float) -> None:
         """Records the heuristic estimate for a PRM node."""
         self.heur_values[node_id] = heur
 
-    def set_optimal_path(self, edges: List[PRMEdge]) -> None:
+    @timed_visualizer_method
+    def set_optimal_path(self, edges: Iterable[PRMEdge]) -> None:
         """Sets the optimal path edges to highlight upon A* query completion."""
         self.optimal_path_edges = set(edges)
 
+    @timed_visualizer_method
+    def clear_optimal_path(self) -> None:
+        """Clears the optimal path highlight."""
+        if self.optimal_path_edges:
+            self.optimal_path_edges.clear()
+            self.update_visualization()
+
+    @timed_visualizer_method
     def get_gradient_color(self, value: float) -> str:
         """Computes HSV gradient color for an active value using a dynamic histogram."""
         self.gradient_values.append(float(value))
@@ -95,6 +125,7 @@ class PRMVisualizer:
             normalized = 0.0
         return obs.get_hsv_gradient(float(np.clip(normalized, 0.0, 1.0)), 1.0, alpha=0.5)
 
+    @timed_visualizer_method
     def clear(self) -> None:
         """Clears all drawn line strips from the canvas and resets state."""
         canvas = self.canvas if self.canvas is not None else obs._active_widget
@@ -110,6 +141,7 @@ class PRMVisualizer:
         self.gradient_values.clear()
         self.value_cache = None
 
+    @timed_visualizer_method
     def update_visualization(self) -> None:
         """Re-evaluates visibility and gradient colors when checkboxes are toggled or display updates."""
         show_path = ui.should_draw_path()
@@ -201,6 +233,7 @@ class PRMPlanner(AStar):
         self.adj_list: Dict[int, List[PRMEdge]] = {}
         self.node_quadtree = qt.QuadTreeObjects(bounds, capacity=num_samples)
         self.visualizer: PRMVisualizer = PRMVisualizer()
+        self.last_optimal_edges: List[PRMEdge] = []
 
     def is_pose_collision_free(self, x: float, y: float, theta: float) -> bool:
         """Checks whether placing the vehicle footprint at (x, y, theta) causes a collision."""
@@ -410,13 +443,19 @@ class PRMPlanner(AStar):
         self,
         start_pose: Tuple[float, float, float],
         goal_region: shr.ExtRegion | shr.SimpleGoalRegion,
+        visualize: bool = True,
     ) -> Optional[List[rsplan.primitives.Path]]:
         """
         Connects start_pose to the roadmap and finds an A* path to a vertex within goal_region.
         """
+        self.last_optimal_edges = []
         if goal_region is None:
+            if visualize and self.visualizer is not None:
+                self.visualizer.clear_optimal_path()
             return None
         if goal_region.contains(start_pose[0], start_pose[1]):
+            if visualize and self.visualizer is not None:
+                self.visualizer.clear_optimal_path()
             return []
         if len(self.nodes) == 0:
             self.generate_roadmap()
@@ -428,32 +467,36 @@ class PRMPlanner(AStar):
 
         if len(valid_connections) > 0:
             valid_connections.sort(key=lambda edge: edge.cost)
-            start_edge = valid_connections[0]
-            start_path = start_edge.path
-            first_node = self.nodes[start_edge.target_id]
-            path = [start_path]
-            rest = self.astar(AStarData(first_node), AStarData(goal_region, True))
-            if rest is not None:
-                node_list = list(rest)
-                optimal_edges = []
-                for a, b in zip(node_list[:-1], node_list[1:]):
-                    if not a.is_goal and not b.is_goal:
-                        prm_a = a.data
-                        prm_b = b.data
-                        for edge in self.adj_list.get(prm_a.id, []):
-                            if edge.target_id == prm_b.id:
-                                optimal_edges.append(edge)
-                                path.append(edge.path)
-                                break
-                if self.visualizer is not None:
-                    self.visualizer.set_optimal_path(optimal_edges)
-                    self.visualizer.update_visualization()
-                return path
-            else:
-                print(f'Goal region {goal_region} is not reachable from {start_pose}.')
-                return None
+            for start_edge in valid_connections:
+                start_path = start_edge.path
+                first_node = self.nodes[start_edge.target_id]
+                rest = self.astar(AStarData(first_node), AStarData(goal_region, True))
+                if rest is not None:
+                    path = [start_path]
+                    node_list = list(rest)
+                    optimal_edges = []
+                    for a, b in zip(node_list[:-1], node_list[1:]):
+                        if not a.is_goal and not b.is_goal:
+                            prm_a = a.data
+                            prm_b = b.data
+                            for edge in self.adj_list.get(prm_a.id, []):
+                                if edge.target_id == prm_b.id:
+                                    optimal_edges.append(edge)
+                                    path.append(edge.path)
+                                    break
+                    self.last_optimal_edges = optimal_edges
+                    if visualize and self.visualizer is not None:
+                        self.visualizer.set_optimal_path(optimal_edges)
+                        self.visualizer.update_visualization()
+                    return path
+            print(f'Goal region {goal_region} is not reachable from {start_pose}.')
+            if visualize and self.visualizer is not None:
+                self.visualizer.clear_optimal_path()
+            return None
         else:
             print(f'No valid connections found for {start_pose}')
+            if visualize and self.visualizer is not None:
+                self.visualizer.clear_optimal_path()
             return None
 
     """
@@ -560,9 +603,13 @@ class Firetruck(obs.DrawableGroup):
         # Motion execution queue
         self._path_queue = []
         self._waypoint_queue: List[rsplan.primitives.Waypoint] = []
+        self._path_edges: List[PRMEdge] = []
         self._step_dist = 0
         self.current_goal: Optional[shr.ExtRegion | shr.SimpleGoalRegion] = None
         self.current_action = FT_MOVE
+        self._sim_time: float = 0.0
+        self._last_replan_time: float = -100.0
+        self._last_default_query_time: float = -100.0
 
         if default_goal is not None:
             self.default_goal: Optional[shr.SimpleGoalRegion] = default_goal
@@ -587,22 +634,41 @@ class Firetruck(obs.DrawableGroup):
         """Tests whether the current body pose collides with the obstacle field."""
         return vp.check_collision(self.body, obs_quadtree)
 
+    def clear_visualizations(self) -> None:
+        """Clears visualizer optimal path highlights."""
+        if getattr(self, 'prm', None) is not None and getattr(self.prm, 'visualizer', None) is not None:
+            self.prm.visualizer.clear_optimal_path()
+
     def clear_motion_queue(self) -> None:
         """Clears all queued paths, waypoints, and resets accumulated step distance."""
         self._path_queue.clear()
         self._waypoint_queue.clear()
+        self._path_edges.clear()
         self._step_dist = 0.0
+        self.clear_visualizations()
 
-    def queue_paths(self, paths: List[rsplan.primitives.Path], clear_queue: bool = True) -> None:
+    def queue_paths(
+        self,
+        paths: List[rsplan.primitives.Path],
+        clear_queue: bool = True,
+        edges: Optional[List[PRMEdge]] = None,
+    ) -> None:
         """Enqueues waypoints from a sequence of rsplan Paths for navigation."""
         if clear_queue:
             self.clear_motion_queue()
         for path in paths:
             self._path_queue.append(path)
+        if edges is not None:
+            self._path_edges = list(edges)
+        elif getattr(self, 'prm', None) is not None and getattr(self.prm, 'last_optimal_edges', None):
+            self._path_edges = list(self.prm.last_optimal_edges)
         if len(self._path_queue) > 0 and (clear_queue or len(self._waypoint_queue) == 0):
             self._waypoint_queue = self._path_queue[0].waypoints()
             if clear_queue:
                 self._step_dist = 0.0
+        if getattr(self, 'prm', None) is not None and getattr(self.prm, 'visualizer', None) is not None:
+            self.prm.visualizer.set_optimal_path(self._path_edges)
+            self.prm.visualizer.update_visualization()
 
     def replan(self):
         """
@@ -617,19 +683,26 @@ class Firetruck(obs.DrawableGroup):
         :return: None
         """
         checked_regions = {}
+        checked_edges = {}
         best = None
         for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 100):
             region = shr.get_ext_region(cell_tup[1], cell_tup[2])
-            if region in checked_regions:
+            if region is None or region in checked_regions:
                 continue
-            if (region.get_timers()[0] > region.get_timers()[1] and
-                region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10)):
+            if getattr(region, 'obs_origin', None) is not None and shr.get_state(*region.obs_origin) != shr.OBS_BURNING:
+                continue
+            timers = region.get_timers()
+            if timers[0] <= timers[1]:
+                continue
+            if region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10):
                 best = region
                 checked_regions[region] = []
+                checked_edges[region] = []
                 break
-            elif region.get_timers()[0] > region.get_timers()[1]:
-                path_candidate = self.prm.query((self.x, self.y, self.theta), region)
+            else:
+                path_candidate = self.prm.query((self.x, self.y, self.theta), region, visualize=False)
                 checked_regions[region] = path_candidate
+                checked_edges[region] = list(getattr(self.prm, 'last_optimal_edges', []))
                 if path_candidate is not None:
                     cand_cost = sum(p.total_length for p in path_candidate)
                     if best is None or checked_regions.get(best) is None:
@@ -639,29 +712,28 @@ class Firetruck(obs.DrawableGroup):
                         if cand_cost < best_cost:
                             best = region
 
-        if best is not None:
-            print(f'Firetruck pathing to {best.obs_origin} ({best.get_timers()[0]:0.2f}s remaining)')
+        if best is not None and checked_regions.get(best) is not None:
             path = checked_regions[best]
-            if path is not None and len(path) == 0: # empty path list means we're there
-                self.current_goal = best
-                shr.set_current_goal(best)
-                self.current_action = FT_EXT
-                self.clear_motion_queue()
-                return
-            elif path is not None and len(path) > 0:
+            edges = checked_edges.get(best, [])
+            if len(path) == 0:
+                if (best.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10)
+                        and getattr(best, 'obs_origin', None) is not None
+                        and shr.get_state(*best.obs_origin) == shr.OBS_BURNING):
+                    self.current_goal = best
+                    shr.set_current_goal(best)
+                    self.current_action = FT_EXT
+                    self.clear_motion_queue()
+                    return
+            elif len(path) > 0:
+                print(f'Firetruck pathing to {best.obs_origin} ({best.get_timers()[0]:0.2f}s remaining)')
                 print(f'Firetruck found path to {best}')
                 self.current_goal = best
                 shr.set_current_goal(best)
-                self.queue_paths(path, clear_queue=True)
+                self.queue_paths(path, clear_queue=True, edges=edges)
                 self.current_action = FT_MOVE
                 return
-            else:
-                self.current_goal = None
-                shr.set_current_goal(None)
-                self.clear_motion_queue()
-                print(f'Firetruck pathing failed')
 
-        # If there's no burning goal, drive to default goal (middle of map)
+        # If there's no burning goal or pathing failed, drive to default goal (middle of map)
         if self.default_goal is not None:
             if self.default_goal.contains(self.x, self.y):
                 self.current_goal = self.default_goal
@@ -669,9 +741,19 @@ class Firetruck(obs.DrawableGroup):
                 self.current_action = FT_MOVE
                 self.clear_motion_queue()
                 return
-            if self.current_goal is self.default_goal and len(self._path_queue) > 0:
-                return
-            path = self.prm.query((self.x, self.y, self.theta), self.default_goal)
+            if self.current_goal is self.default_goal:
+                if len(self._path_queue) > 0:
+                    self.current_action = FT_MOVE
+                    return
+                # Failsafe: avoid re-querying PRM for default goal every frame
+                now = getattr(self, '_sim_time', 0.0)
+                if now - getattr(self, '_last_default_query_time', -100.0) < 1.0:
+                    self.current_action = FT_MOVE
+                    return
+
+            self._last_default_query_time = getattr(self, '_sim_time', 0.0)
+            path = self.prm.query((self.x, self.y, self.theta), self.default_goal, visualize=False)
+            edges = list(getattr(self.prm, 'last_optimal_edges', []))
             if path is not None and len(path) == 0:
                 self.current_goal = self.default_goal
                 shr.set_current_goal(self.default_goal)
@@ -682,15 +764,21 @@ class Firetruck(obs.DrawableGroup):
                 print(f'Firetruck pathing to default goal')
                 self.current_goal = self.default_goal
                 shr.set_current_goal(self.default_goal)
-                self.queue_paths(path, clear_queue=True)
+                self.queue_paths(path, clear_queue=True, edges=edges)
                 self.current_action = FT_MOVE
                 return
             else:
                 print(f'Firetruck pathing to default goal failed')
+                self.current_goal = self.default_goal
+                shr.set_current_goal(self.default_goal)
+                self.clear_motion_queue()
+                self.current_action = FT_MOVE
+                return
 
         self.current_goal = None
         shr.set_current_goal(None)
         self.clear_motion_queue()
+        self.current_action = FT_MOVE
 
     def try_extinguish(self):
         """
@@ -701,19 +789,25 @@ class Firetruck(obs.DrawableGroup):
         3. return false
         :return: True if extinguishing this step, False otherwise
         """
-        if self.current_goal is not None:
-            if (self.current_goal.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10) and
+        if self.current_goal is not None and not isinstance(self.current_goal, shr.SimpleGoalRegion):
+            if (getattr(self.current_goal, 'obs_origin', None) is not None and
+                shr.get_state(*self.current_goal.obs_origin) == shr.OBS_BURNING and
+                self.current_goal.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10) and
                 self.current_goal.get_timers()[0] > self.current_goal.get_timers()[1]):
                     shr.extinguishing_from(self)
                     return True
-            for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 8):
-                region = shr.get_ext_region(cell_tup[1], cell_tup[2])
-                if (region.get_timers()[0] > region.get_timers()[1] and
-                    region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10)):
-                    self.current_goal = region
-                    shr.set_current_goal(region)
-                    shr.extinguishing_from(self)
-                    return True
+        for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 8):
+            region = shr.get_ext_region(cell_tup[1], cell_tup[2])
+            if (region is not None and
+                getattr(region, 'obs_origin', None) is not None and
+                shr.get_state(*region.obs_origin) == shr.OBS_BURNING and
+                region.get_timers()[0] > region.get_timers()[1] and
+                region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10)):
+                self.current_goal = region
+                shr.set_current_goal(region)
+                self.clear_motion_queue()
+                shr.extinguishing_from(self)
+                return True
         self.current_action = FT_MOVE
         return False
 
@@ -725,6 +819,7 @@ class Firetruck(obs.DrawableGroup):
         3. If no moves planned, return
         4. Handle movement according to _path_queue
         """
+        self._sim_time = getattr(self, '_sim_time', 0.0) + dt
         if self.current_action == FT_EXT and self.try_extinguish():
             return
 
@@ -735,19 +830,51 @@ class Firetruck(obs.DrawableGroup):
             for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 100)
             if (region := shr.get_ext_region(cell_tup[1], cell_tup[2])) is not None
         )
-        at_default = is_default_goal and self.current_goal.contains(self.x, self.y)
+        at_default = is_default_goal and (self.current_goal.contains(self.x, self.y) or len(self._path_queue) == 0)
+        goal_is_burning = (
+            not is_default_goal
+            and self.current_goal is not None
+            and getattr(self.current_goal, 'obs_origin', None) is not None
+            and shr.get_state(*self.current_goal.obs_origin) == shr.OBS_BURNING
+        )
 
         should_replan = (
             self.current_goal is None
             or (is_default_goal and has_fires)
-            or (not is_default_goal and (goal_burn == np.inf or goal_burn < goal_ext))
+            or (not is_default_goal and (goal_burn == np.inf or goal_burn < goal_ext or not goal_is_burning))
             or (len(self._path_queue) == 0 and not at_default)
         )
         if should_replan:
-            self.replan()
+            now = getattr(self, '_sim_time', 0.0)
+            if is_default_goal and (now - getattr(self, '_last_replan_time', -100.0) < 1.0):
+                pass
+            else:
+                self._last_replan_time = now
+                self.replan()
 
         if self.current_action == FT_EXT and self.try_extinguish(): # check again after replanning
             return
+
+        while self._path_queue and (abs(self._path_queue[0].total_length) <= 1e-9 or not self._waypoint_queue):
+            self._path_queue.pop(0)
+            if self._path_edges and len(self._path_edges) >= len(self._path_queue):
+                self._path_edges.pop(0)
+                if getattr(self, 'prm', None) is not None and getattr(self.prm, 'visualizer', None) is not None:
+                    self.prm.visualizer.set_optimal_path(self._path_edges)
+                    self.prm.visualizer.update_visualization()
+            if self._path_queue:
+                self._waypoint_queue = self._path_queue[0].waypoints()
+                self._step_dist = 0.0
+            else:
+                self._waypoint_queue = []
+                self._step_dist = 0.0
+                self.clear_motion_queue()
+                if self.current_goal is not None and not isinstance(self.current_goal, shr.SimpleGoalRegion):
+                    self.current_action = FT_EXT
+                    self.try_extinguish()
+                else:
+                    self.current_action = FT_MOVE
+                return
 
         if dt <= 0 or self.speed <= 0 or not self._waypoint_queue or len(self._path_queue) == 0 or self.current_action != FT_MOVE:
             return
@@ -775,10 +902,21 @@ class Firetruck(obs.DrawableGroup):
                     self._step_dist = 0.0
                 last_wp = self._waypoint_queue[-1]
                 self._path_queue.pop(0)
+                if self._path_edges and len(self._path_edges) >= len(self._path_queue):
+                    self._path_edges.pop(0)
+                    if getattr(self, 'prm', None) is not None and getattr(self.prm, 'visualizer', None) is not None:
+                        self.prm.visualizer.set_optimal_path(self._path_edges)
+                        self.prm.visualizer.update_visualization()
                 if not self._path_queue:
                     self._waypoint_queue = []
                     self._step_dist = 0.0
                     self.set_pose(last_wp.x, last_wp.y, last_wp.yaw)
+                    self.clear_motion_queue()
+                    if self.current_goal is not None and not isinstance(self.current_goal, shr.SimpleGoalRegion):
+                        self.current_action = FT_EXT
+                        self.try_extinguish()
+                    else:
+                        self.current_action = FT_MOVE
                     return
                 path = self._path_queue[0]
                 self._waypoint_queue = path.waypoints()

@@ -68,6 +68,8 @@ _obstacle_to_ext_region = {}
 _current_goal = None
 _obstacle_to_rects: dict[tuple[int, int], list[obs.DrawableRect]] = {}
 _cell_to_rect: dict[tuple[int, int], obs.DrawableRect] = {}
+_firetruck_score: int = 0
+_wumpus_score: int = 0
 
 
 class ExtRegion(obs.DrawableGroup):
@@ -166,8 +168,8 @@ class ExtRegion(obs.DrawableGroup):
         """
         :return: Tuple of (burn_timer, ext_timer)
         """
-        if get_state(*self.obs_origin) == OBS_BURNING:
-            return (_burn_timers[self.obs_origin], _ext_timers[self.obs_origin])
+        if self.obs_origin is not None and _obstacle_to_state.get(self.obs_origin) == OBS_BURNING:
+            return (_burn_timers.get(self.obs_origin, np.inf), _ext_timers.get(self.obs_origin, np.inf))
         return (np.inf, np.inf)
 
 
@@ -289,13 +291,13 @@ def update_ext_regions():
         _current_goal.update_visualization(True)
 
 
-def resolve_obstacle_origin(x: int, y: int) -> tuple[int, int] | None:
+def resolve_obstacle_origin(x: int | float, y: int | float) -> tuple[int, int] | None:
     """
     Resolves coordinates (x, y) to its obstacle origin tuple.
     Handles both direct obstacle origin coordinates and cell coordinates within an obstacle,
     supporting tetrominoes whose bounding box origin (0, 0) is empty (e.g. T-blocks, L-blocks).
     """
-    coord = (x, y)
+    coord = (int(round(x)), int(round(y)))
     if coord in _obstacle_to_cells:
         return coord
     if coord in _cell_to_obstacle:
@@ -329,8 +331,19 @@ def qt_rect(coord):
 
 def init(field_width, field_height, cell_to_obstacle, obstacle_to_cells):
     global EXT_RANGE, _cell_to_obstacle, _obstacle_to_cells, _obstacle_to_rects, _cell_to_rect
+    global _current_goal, _ext_coords, _ext_fresh, _firetruck_score, _wumpus_score
+    _firetruck_score = 0
+    _wumpus_score = 0
     _obstacle_to_rects.clear()
     _cell_to_rect.clear()
+    _burn_timers.clear()
+    _ext_timers.clear()
+    _obstacle_to_state.clear()
+    _obstacle_to_ext_region.clear()
+    _obstacle_to_qttups.clear()
+    _current_goal = None
+    _ext_coords = None
+    _ext_fresh = False
     EXT_RANGE = ui.meters_to_cells(10)
     print('Creating shrubbery quadtrees...')
     _state_qts[OBS_INTACT] = qt.RectQuadTree((0, 0, field_width, field_height),
@@ -343,8 +356,6 @@ def init(field_width, field_height, cell_to_obstacle, obstacle_to_cells):
                                                   int(field_width * field_height * 0.1))
     _cell_to_obstacle = dict(cell_to_obstacle) if cell_to_obstacle else {}
     _obstacle_to_cells = obstacle_to_cells
-    for o in _obstacle_to_cells.keys():
-        _cell_to_obstacle[o] = o
     print('Populating shrubbery quadtrees...')
     for o in _obstacle_to_cells.keys():
         create_state(o[0], o[1])
@@ -388,10 +399,12 @@ def create_state(x, y):
 
 
 def ignite(x, y):
+    global _wumpus_score
     obs_origin = resolve_obstacle_origin(x, y)
     if obs_origin is not None:
         state = _obstacle_to_state.get(obs_origin, 0)
         if state == OBS_INTACT or state == OBS_EXT:
+            _wumpus_score += 1
             print(f'Obstacle at {obs_origin} ignited from {x, y}')
             for tup in _obstacle_to_qttups[obs_origin]:
                 _state_qts[state].delete_tuple(tup)
@@ -411,19 +424,23 @@ def extinguishing_from(truck):
         _ext_fresh = True
         if _ext_coords is None or abs(_ext_coords[0] - truck.x) > 0.001/ui.fps or abs(_ext_coords[1] - truck.y) > 0.001/ui.fps:
             _ext_coords = (truck.x, truck.y)
-            for t in _ext_timers:
-                _ext_timers[t] = 5.0
+            for t in list(_ext_timers.keys()):
+                if _obstacle_to_state.get(t) == OBS_BURNING:
+                    _ext_timers[t] = 5.0
 
 def extinguish(x, y):
+    global _firetruck_score
     obs_origin = resolve_obstacle_origin(x, y)
     if obs_origin is not None:
         state = _obstacle_to_state.get(obs_origin, 0)
-        if state == OBS_BURNING and _ext_timers[obs_origin] <= 0:
+        if state == OBS_BURNING and _ext_timers.get(obs_origin, np.inf) <= 0:
+            _firetruck_score += 2
             print(f'Obstacle at {obs_origin} extinguished from {x, y}')
             for tup in _obstacle_to_qttups[obs_origin]:
                 _state_qts[state].delete_tuple(tup)
                 _state_qts[OBS_EXT].insert(tup[1:], tup[0])
             _burn_timers.pop(obs_origin, None)
+            _ext_timers.pop(obs_origin, None)
             _obstacle_to_state[obs_origin] = OBS_EXT
             for r in _obstacle_to_rects.get(obs_origin, ()):
                 r.fill_color = COLOR_OBS_EXT
@@ -431,11 +448,13 @@ def extinguish(x, y):
 
 
 def finish_burning(x, y):
+    global _wumpus_score
     obs_origin = resolve_obstacle_origin(x, y)
     if obs_origin is not None:
         state = _obstacle_to_state.get(obs_origin, 0)
         timer = _burn_timers.get(obs_origin, np.inf)
         if state == OBS_BURNING and timer <= 0:
+            _wumpus_score += 1
             print(f'Obstacle at {obs_origin} finished burning; igniting neighbors')
             for tup in _obstacle_to_qttups[obs_origin]:
                 center = ((tup[1] + tup[3])/2, (tup[2] + tup[4])/2)
@@ -502,7 +521,7 @@ def get_burn_timers():
 def has_extinguishable_fires() -> bool:
     """Returns True if there is at least one burning obstacle with burn_timer > ext_timer."""
     for origin, burn_time in _burn_timers.items():
-        if burn_time > _ext_timers.get(origin, np.inf):
+        if _obstacle_to_state.get(origin) == OBS_BURNING and burn_time > _ext_timers.get(origin, np.inf):
             return True
     return False
 
@@ -518,7 +537,7 @@ def step(dt):
     global _ext_fresh, _ext_timers, _ext_coords
     obs_to_check = set(_burn_timers.keys())
     for o in obs_to_check:
-        if _obstacle_to_state[o] == OBS_BURNING and o in _burn_timers and o in _ext_timers:
+        if _obstacle_to_state.get(o) == OBS_BURNING and o in _burn_timers and o in _ext_timers:
             if _ext_fresh:
                 dist, v = _obstacle_to_ext_region[o].get_minimum_distance(*_ext_coords)
                 if dist <= ui.meters_to_cells(10):
@@ -534,6 +553,23 @@ def step(dt):
                 for r in _obstacle_to_rects.get(o, ()):
                     r.fill_color = burn_col
         else:
-            print(f'burning obstacle {obs} is missing timer?')
+            if _obstacle_to_state.get(o) != OBS_BURNING:
+                _burn_timers.pop(o, None)
+                _ext_timers.pop(o, None)
+            else:
+                print(f'burning obstacle {o} is missing timer?')
     update_ext_regions()
     _ext_fresh = False
+
+
+def get_firetruck_score() -> int:
+    return _firetruck_score
+
+
+def get_wumpus_score() -> int:
+    return _wumpus_score
+
+
+def get_unburnt_obstacle_count() -> int:
+    """Number of obstacles remaining that aren't in the burnt state."""
+    return sum(1 for state in _obstacle_to_state.values() if state != OBS_BURNED)

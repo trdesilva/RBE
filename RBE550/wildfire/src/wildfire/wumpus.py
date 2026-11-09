@@ -72,37 +72,46 @@ class Wumpus(obs.DrawableGroup, AStar):
                      for i in range(self.wumpus_grid_res)
                      for j in range(self.wumpus_grid_res)
                      for cell in shr._obstacle_to_cells[shr.resolve_obstacle_origin(tup[1], tup[2])] ]
-            heur = self.heuristic_cost_estimate(AStarData((int(self.x * self.wumpus_grid_res),
-                                                           int(self.y * self.wumpus_grid_res))),
+            heur = self.heuristic_cost_estimate(AStarData((int(round(self.x * self.wumpus_grid_res)),
+                                                           int(round(self.y * self.wumpus_grid_res)))),
                                                 AStarData(cells, True))
             if self.truck is not None:
-                heur -= 2*self.heuristic_cost_estimate(AStarData((int(self.truck.x * self.wumpus_grid_res),
-                                                                  int(self.truck.y * self.wumpus_grid_res))),
+                heur -= 2*self.heuristic_cost_estimate(AStarData((int(round(self.truck.x * self.wumpus_grid_res)),
+                                                                  int(round(self.truck.y * self.wumpus_grid_res)))),
                                                        AStarData(cells, True))
             if best is None or heur < best[1]:
                 best = (cells, heur)
 
         if best is not None:
             goal = best[0]
-        scaled_start = int(self.x * self.wumpus_grid_res), int(self.y * self.wumpus_grid_res)
+        scaled_start = (int(round(self.x * self.wumpus_grid_res)), int(round(self.y * self.wumpus_grid_res)))
         path = self.astar(AStarData(scaled_start), AStarData(goal if not len(goal) == 0 else [(0, 0)], True))
         if path is not None:
-            self.moves = (np.array([i.data for i in list(path)])/self.wumpus_grid_res).tolist()
+            nodes = [i.data for i in list(path)]
+            if len(nodes) > 1 and nodes[0] == scaled_start:
+                nodes = nodes[1:]
+            elif len(nodes) == 1 and nodes[0] == scaled_start:
+                nodes = []
+            self.moves = (np.array(nodes)/self.wumpus_grid_res).tolist() if len(nodes) > 0 else []
         else:
             print(f'wumpus failed to path')
 
     def ignite_neighbors(self):
-        for i in [(-1., 0), (1., 0), (0, -1.), (0, 1.)]:
-            x, y = (self.x + i[0]/self.wumpus_grid_res, self.y + i[1]/self.wumpus_grid_res)
-            # obstacles only exist within integer cell boundaries
-            if (((x % 1 < 1./self.wumpus_grid_res) or (1 - (x % 1) < 1./self.wumpus_grid_res)) and
-                ((y % 1 < 1. / self.wumpus_grid_res) or (1 - (y % 1) < 1. / self.wumpus_grid_res))):
-                shr.ignite(int(x), int(y))
+        wx = int(round(self.x * self.wumpus_grid_res))
+        wy = int(round(self.y * self.wumpus_grid_res))
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            cx = (wx + dx) // self.wumpus_grid_res
+            cy = (wy + dy) // self.wumpus_grid_res
+            if 0 <= cx < self.grid_width and 0 <= cy < self.grid_height:
+                shr.ignite(cx, cy)
 
     @functools.cache
     def _check_collision_cached(self, wump_coords):
-        world_coords = (int(float(wump_coords[0])/self.wumpus_grid_res), int(float(wump_coords[1])/self.wumpus_grid_res))
-        return shr.get_state(*world_coords) > 0
+        cx = wump_coords[0] // self.wumpus_grid_res
+        cy = wump_coords[1] // self.wumpus_grid_res
+        if cx < 0 or cx >= self.grid_width or cy < 0 or cy >= self.grid_height:
+            return True
+        return shr.get_state(cx, cy) > 0
 
     def check_collision(self, wump_coords = None):
         if wump_coords is None:
