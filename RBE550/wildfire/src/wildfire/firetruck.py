@@ -502,6 +502,8 @@ class PRMPlanner(AStar):
             return goal.data.contains(current.data.pose[0], current.data.pose[1])
         return False
 
+FT_MOVE = 0
+FT_EXT = 1
 
 class Firetruck(obs.DrawableGroup):
     """
@@ -548,66 +550,123 @@ class Firetruck(obs.DrawableGroup):
         )
         self.speed = ui.meters_to_cells(speed)
 
-        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 200, 10, 16, 5)
+        self.prm = PRMPlanner(obs_quadtree, self.body, (0, 0, 25, 25), self.turn_radius, 0.1, 200, 10, 16, 8)
 
         # Motion execution queue
         self._path_queue = []
         self._waypoint_queue: List[rsplan.primitives.Waypoint] = []
         self._step_dist = 0
         self.current_goal: Optional[shr.ExtRegion] = None
+        self.current_action = FT_MOVE
 
     def check_collision(self, obs_quadtree: qt.RectQuadTree) -> bool:
         """Tests whether the current body pose collides with the obstacle field."""
         return vp.check_collision(self.body, obs_quadtree)
 
-    def queue_paths(self, paths: List[rsplan.primitives.Path]) -> None:
+    def queue_paths(self, paths: List[rsplan.primitives.Path], clear_queue = True) -> None:
         """Enqueues waypoints from a sequence of rsplan Paths for navigation."""
+        if clear_queue:
+            self._path_queue.clear()
+            self._waypoint_queue.clear()
         for path in paths:
             self._path_queue.append(path)
         if len(self._path_queue) > 0:
             self._waypoint_queue = self._path_queue[0].waypoints()
 
     def replan(self):
-        timer_pairs = [(coords, time) for coords, time in shr.get_burn_timers().items()]
-        timer_pairs.sort(key=lambda pair: pair[1])
+        """
+        1. Find the nearest fire it's possible to make it to in time and make it the goal
+            a. For each nearest burning neighbor
+                i. if extinguish timer < burn timer and in range, set goal = neighbor and break
+                ii. elif extinguish timer < burn timer, calculate A* path
+            b. sort path candidates by total length
+            c. if shortest path length / speed < burn timer - extinguish timer, set goal and queue path
+        2. If in extinguish range of goal, set action to extinguishing, else set action to moving
+        2. If there's no goal, drive to the middle of the map
+        :return: None
+        """
+        checked_regions = {}
         best = None
-        for timer in timer_pairs:
-            if best is None or timer[1] < best[1] or best[1] < 5 < timer[1]:
-                best = timer
+        for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 100):
+            region = shr.get_ext_region(cell_tup[1], cell_tup[2])
+            if region in checked_regions:
+                continue
+            if (region.get_timers()[0] > region.get_timers()[1] and
+                region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10)):
+                best = region
+                checked_regions[region] = []
+                break
+            elif region.get_timers()[0] > region.get_timers()[1]:
+                checked_regions[region] = self.prm.query((self.x, self.y, self.theta), region)
+                if best is None or (sum([p.total_length for p in checked_regions[region]])
+                                    < sum([p.total_length for p in checked_regions[best]])):
+                    best = region
+
         if best is not None:
-            print(f'Firetruck pathing to {best[0]} ({best[1]:0.2f}s remaining)')
-            goal = shr.get_ext_region(*best[0])
-            if goal is None:
-                self.current_goal = None
-                shr.set_current_goal(None)
-                print(f'Firetruck pathing failed: goal ExtRegion is None for {best[0]}')
+            print(f'Firetruck pathing to {best.obs_origin} ({best.get_timers()[0]:0.2f}s remaining)')
+            path = checked_regions[best]
+            if path is not None and len(path) == 0: # empty path list means we're there
+                self.current_goal = best
+                shr.set_current_goal(best)
+                self.current_action = FT_EXT
                 return
-            path = self.prm.query((self.x, self.y, self.theta), goal)
-            if path is not None:
-                print(f'Firetruck found path to {best[0]}')
-                self.current_goal = goal
-                shr.set_current_goal(goal)
+            elif path is not None and len(path) > 0:
+                print(f'Firetruck found path to {best}')
+                self.current_goal = best
+                shr.set_current_goal(best)
                 self.queue_paths(path)
+                self.current_action = FT_MOVE
+                return
             else:
                 self.current_goal = None
                 shr.set_current_goal(None)
                 print(f'Firetruck pathing failed')
-        else:
-            self.current_goal = None
-            shr.set_current_goal(None)
+        # TODO go to middle
+        self.current_goal = None
+        shr.set_current_goal(None)
+
+    def try_extinguish(self):
+        """
+        1. Check if goal is in range and extinguish timer < burn timer
+            a. true: extinguish and return
+        2. For each nearest burning neighbor, check if in range and extinguish timer < burn timer
+            a. true: extinguish and return
+        3. return false
+        :return: True if extinguishing this step, False otherwise
+        """
+        if self.current_goal is not None:
+            if (self.current_goal.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10) and
+                self.current_goal.get_timers()[0] > self.current_goal.get_timers()[1]):
+                    shr.extinguishing_from(self)
+                    return True
+            for cell_tup in shr.nearest_neighbors(self.x, self.y, shr.OBS_BURNING, 8):
+                region = shr.get_ext_region(cell_tup[1], cell_tup[2])
+                if (region.get_timers()[0] > region.get_timers()[1] and
+                    region.get_minimum_distance(self.x, self.y)[0] < ui.meters_to_cells(10)):
+                    self.current_goal = region
+                    shr.set_current_goal(region)
+                    shr.extinguishing_from(self)
+                    return True
+        return False
 
     def step(self, dt: float) -> None:
         """
-        Advances the vehicle pose along the queued Reeds-Shepp waypoints.
-        Moves only the body rectangle as it navigates.
+        1. If extinguishing, try_extinguish()
+            a. return if try_extinguish() returns true
+        2. If no moves planned or goal unset or goal is middle of map or goal extinguish timer < burn timer, replan
+        3. If no moves planned, return
+        4. Handle movement according to _path_queue
         """
-        if len(self._path_queue) == 0:
-            self.replan()
-
-        if len(self._path_queue) == 0:
+        if self.current_action == FT_EXT and self.try_extinguish():
             return
 
-        if dt <= 0 or self.speed <= 0 or not self._waypoint_queue:
+        if len(self._path_queue) == 0 or self.current_goal is None or self.current_goal.get_timers()[0] < self.current_goal.get_timers()[1]:
+            self.replan()
+
+        if self.current_action == FT_EXT and self.try_extinguish(): # check again after replanning
+            return
+
+        if dt <= 0 or self.speed <= 0 or not self._waypoint_queue or len(self._path_queue) == 0 or self.current_action != FT_MOVE:
             return
 
         path = self._path_queue[0]

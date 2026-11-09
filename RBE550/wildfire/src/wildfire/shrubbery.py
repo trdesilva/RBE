@@ -5,6 +5,7 @@ import numpy as np
 
 import valet.grid_sim as ui
 import valet.obstacle_field as obs
+import firetruck as ft
 
 OBS_INTACT = 1
 OBS_BURNING = 2
@@ -60,6 +61,9 @@ _burn_timers: dict[tuple[int, int], float] = {}
 Dictionary mapping from (x, y) coordinate pairs for obstacle origins to number of seconds left before the burning state
 transitions to the burned state.
 """
+_ext_coords = None
+_ext_timers = {}
+_ext_fresh = False
 _obstacle_to_ext_region = {}
 _current_goal = None
 _obstacle_to_rects: dict[tuple[int, int], list[obs.DrawableRect]] = {}
@@ -69,7 +73,7 @@ _cell_to_rect: dict[tuple[int, int], obs.DrawableRect] = {}
 class ExtRegion(obs.DrawableGroup):
     def __init__(self, obs_origin):
         super().__init__(visible=False)
-        self.obs_origin = obs_origin
+        self.obs_origin = resolve_obstacle_origin(*obs_origin)
         self.verts = set()
         for tup in _obstacle_to_qttups[self.obs_origin]:
             for i in [(0, 0), (2, 0), (0, 2), (2, 2)]:
@@ -144,6 +148,11 @@ class ExtRegion(obs.DrawableGroup):
 
     @functools.lru_cache(maxsize=250)
     def get_minimum_distance(self, x, y):
+        """
+        :param x: x to measure from
+        :param y: y to measure from
+        :return: Tuple of (minimum_distance_to, obs_vertex)
+        """
         minimum = np.inf
         min_vert= None
         for v in self.verts:
@@ -152,6 +161,14 @@ class ExtRegion(obs.DrawableGroup):
                 minimum = check
                 min_vert = v
         return np.sqrt(minimum), min_vert
+
+    def get_timers(self):
+        """
+        :return: Tuple of (burn_timer, ext_timer)
+        """
+        if get_state(*self.obs_origin) == OBS_BURNING:
+            return (_burn_timers[self.obs_origin], _ext_timers[self.obs_origin])
+        return (np.inf, np.inf)
 
 
 def set_current_goal(goal: ExtRegion | None):
@@ -281,6 +298,7 @@ def ignite(x, y):
                 _state_qts[state].delete_tuple(tup)
                 _state_qts[OBS_BURNING].insert(tup[1:], tup[0])
             _burn_timers[obs_origin] = 10.0
+            _ext_timers[obs_origin] = 5.0
             _obstacle_to_state[obs_origin] = OBS_BURNING
             burn_col = get_burn_color(10.0)
             for r in _obstacle_to_rects.get(obs_origin, ()):
@@ -288,11 +306,20 @@ def ignite(x, y):
             update_ext_regions()
 
 
+def extinguishing_from(truck):
+    global _ext_fresh, _ext_coords, ext_timer
+    if truck.current_action == ft.FT_EXT:
+        _ext_fresh = True
+        if _ext_coords is None or abs(_ext_coords[0] - truck.x) > 0.001/ui.fps or abs(_ext_coords[1] - truck.y) > 0.001/ui.fps:
+            _ext_coords = (truck.x, truck.y)
+            for t in _ext_timers:
+                _ext_timers[t] = 5.0
+
 def extinguish(x, y):
     obs_origin = resolve_obstacle_origin(x, y)
     if obs_origin is not None:
         state = _obstacle_to_state.get(obs_origin, 0)
-        if state == OBS_BURNING:
+        if state == OBS_BURNING and _ext_timers[obs_origin] <= 0:
             print(f'Obstacle at {obs_origin} extinguished from {x, y}')
             for tup in _obstacle_to_qttups[obs_origin]:
                 _state_qts[state].delete_tuple(tup)
@@ -339,6 +366,7 @@ def finish_burning(x, y):
                 _state_qts[state].delete_tuple(tup)
                 _state_qts[OBS_BURNED].insert(tup[1:], tup[0])
             _burn_timers.pop(obs_origin, None)
+            _ext_timers.pop(obs_origin, None)
             _obstacle_to_state[obs_origin] = OBS_BURNED
             for r in _obstacle_to_rects.get(obs_origin, ()):
                 r.fill_color = COLOR_OBS_BURNED
@@ -380,16 +408,25 @@ def get_ext_region(x, y):
 
 
 def step(dt):
+    global _ext_fresh, _ext_timers, _ext_coords
     obs_to_check = set(_burn_timers.keys())
-    for obs in obs_to_check:
-        if _obstacle_to_state[obs] == OBS_BURNING and obs in _burn_timers:
-            _burn_timers[obs] -= dt
-            if _burn_timers[obs] <= 0:
-                finish_burning(*obs)
+    for o in obs_to_check:
+        if _obstacle_to_state[o] == OBS_BURNING and o in _burn_timers and o in _ext_timers:
+            if _ext_fresh:
+                dist, v = _obstacle_to_ext_region[o].get_minimum_distance(*_ext_coords)
+                if dist <= ui.meters_to_cells(10):
+                    _ext_timers[o] -= dt
+                if _ext_timers[o] <= 0 and _ext_coords is not None:
+                    extinguish(*o)
+                    continue
+            _burn_timers[o] -= dt
+            if _burn_timers[o] <= 0:
+                finish_burning(*o)
             else:
-                burn_col = get_burn_color(_burn_timers[obs])
-                for r in _obstacle_to_rects.get(obs, ()):
+                burn_col = get_burn_color(_burn_timers[o])
+                for r in _obstacle_to_rects.get(o, ()):
                     r.fill_color = burn_col
         else:
             print(f'burning obstacle {obs} is missing timer?')
     update_ext_regions()
+    _ext_fresh = False
