@@ -161,19 +161,19 @@ def parse_color_rgba(color: Any, default_alpha: float = 1.0) -> tuple[float, flo
     if color is None:
         return (0.0, 0.0, 0.0, 0.0)
 
+    try:
+        cached = _rgba_cache.get(color)
+        if cached is not None:
+            return cached
+    except TypeError:
+        pass
+
     # Fast path for 4-element float tuple already normalized
     if isinstance(color, tuple):
         if len(color) == 4 and isinstance(color[0], float) and isinstance(color[1], float) and isinstance(color[2], float) and isinstance(color[3], float):
             if color[0] <= 1.0 and color[1] <= 1.0 and color[2] <= 1.0 and color[3] <= 1.0:
+                _rgba_cache[color] = color
                 return color
-        cached = _rgba_cache.get(color)
-        if cached is not None:
-            return cached
-
-    if isinstance(color, str):
-        cached = _rgba_cache.get(color)
-        if cached is not None:
-            return cached
 
     res: tuple[float, float, float, float]
     if isinstance(color, (tuple, list, np.ndarray)):
@@ -506,10 +506,12 @@ class DrawableRect(TF2DOwner):
         """
         world_verts = self.get_world_vertices()
         # world_verts has shape (2, 4): row 0 is x, row 1 is y
-        minx = np.min(world_verts[0, :])
-        miny = np.min(world_verts[1, :])
-        maxx = np.max(world_verts[0, :])
-        maxy = np.max(world_verts[1, :])
+        w0 = world_verts[0]
+        w1 = world_verts[1]
+        minx = min(w0[0], w0[1], w0[2], w0[3])
+        miny = min(w1[0], w1[1], w1[2], w1[3])
+        maxx = max(w0[0], w0[1], w0[2], w0[3])
+        maxy = max(w1[0], w1[1], w1[2], w1[3])
         # fastquadtree convention (minx, miny, maxx, maxy), else two column vectors
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 
@@ -656,6 +658,165 @@ class DrawableLineStrip(TF2DOwner):
         maxy = float(np.max(world_verts[1, :]))
         return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
 
+_unit_circle_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+
+def _get_unit_circle_templates(num_segments: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Precomputes unit circle perimeter, triangle fan, and border segments
+    for a given segment count, enabling vectorized, parallelized transformations.
+    """
+    entry = _unit_circle_cache.get(num_segments)
+    if entry is not None:
+        return entry
+    angles = np.linspace(0, 2.0 * np.pi, num_segments, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+
+    perimeter = np.array([cos_a, sin_a], dtype=np.float64)
+
+    tri = np.empty((num_segments, 3, 2), dtype=np.float64)
+    tri[:, 0, :] = 0.0
+    tri[:, 1, 0] = cos_a
+    tri[:, 1, 1] = sin_a
+    tri[:, 2, 0] = np.roll(cos_a, -1)
+    tri[:, 2, 1] = np.roll(sin_a, -1)
+    tri_pts = np.ascontiguousarray(tri.reshape(-1, 2).T, dtype=np.float64)
+
+    border = np.empty((num_segments, 2, 2), dtype=np.float64)
+    border[:, 0, 0] = cos_a
+    border[:, 0, 1] = sin_a
+    border[:, 1, 0] = np.roll(cos_a, -1)
+    border[:, 1, 1] = np.roll(sin_a, -1)
+    border_pts = np.ascontiguousarray(border.reshape(-1, 2).T, dtype=np.float64)
+
+    entry = (perimeter, tri_pts, border_pts)
+    _unit_circle_cache[num_segments] = entry
+    return entry
+
+
+class DrawableCircle(TF2DOwner):
+    """
+    A transformable 2D circle drawable on the grid or in screen pixels.
+    All vertex APIs return column vectors of shape (2, N).
+    """
+    def __init__(
+        self,
+        x: float = 0.0,
+        y: float = 0.0,
+        radius: float = 1.0,
+        theta: float = 0.0,
+        fill_color: Any = (1.0, 0.0, 0.0, 1.0),
+        border_color: Any = None,
+        border_width: float = 1.0,
+        coordinate_frame: str = "grid",  # "grid" or "pixel"
+        visible: bool = True,
+        parent: TF2DOwner | None = None,
+        num_segments: int = 32,
+    ):
+        super().__init__(x=x, y=y, theta=theta, parent=parent)
+        self._radius = float(radius)
+        self.fill_color = fill_color
+        self.border_color = border_color
+        self.border_width = float(border_width)
+        self.coordinate_frame = coordinate_frame
+        self.visible = visible
+        self.num_segments = int(num_segments)
+        self._cached_local_vertices: np.ndarray | None = None
+        self._cached_world_vertices: np.ndarray | None = None
+        self._cached_tri_verts: np.ndarray | None = None
+        self._cached_border_verts: np.ndarray | None = None
+
+    @property
+    def radius(self) -> float:
+        return self._radius
+
+    @radius.setter
+    def radius(self, val: float):
+        fval = float(val)
+        if self._radius != fval:
+            self._radius = fval
+            self._mark_dirty()
+
+    def _mark_dirty(self):
+        super()._mark_dirty()
+        self._cached_local_vertices = None
+        self._cached_world_vertices = None
+        self._cached_tri_verts = None
+        self._cached_border_verts = None
+
+    def copy(self):
+        return DrawableCircle(
+            self.x, self.y, self.radius, self.theta,
+            self.fill_color, self.border_color, self.border_width,
+            self.coordinate_frame, self.visible, self.parent, self.num_segments
+        )
+
+    def get_local_vertices(self) -> np.ndarray:
+        """
+        Returns the perimeter vertices of the circle relative to its center
+        as column vectors of shape (2, num_segments).
+        """
+        if self._cached_local_vertices is None:
+            perimeter, _, _ = _get_unit_circle_templates(self.num_segments)
+            self._cached_local_vertices = perimeter * self._radius
+        return self._cached_local_vertices
+
+    def get_world_vertices(self) -> np.ndarray:
+        """
+        Transforms perimeter vertices into world (grid or root parent) coordinates
+        as column vectors of shape (2, num_segments).
+        """
+        if not self._dirty_transform and self._cached_world_vertices is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_world_vertices
+        res = self.transform_points(self.get_local_vertices())
+        self._cached_world_vertices = res
+        return res
+
+    def get_tri_vertices(self) -> np.ndarray:
+        """
+        Returns the vertices forming a triangle fan for GL_TRIANGLES in world space
+        as a (3 * num_segments, 2) float32 array, computed via vectorized matrix transformation.
+        """
+        if not self._dirty_transform and self._cached_tri_verts is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_tri_verts
+
+        _, tri_pts, _ = _get_unit_circle_templates(self.num_segments)
+        local_pts = tri_pts * self._radius
+        w_tri = self.transform_points(local_pts).T.astype(np.float32)
+        res = np.ascontiguousarray(w_tri)
+        self._cached_tri_verts = res
+        return res
+
+    def get_border_vertices(self) -> np.ndarray:
+        """
+        Returns the perimeter line segments for GL_LINES in world space
+        as a (2 * num_segments, 2) float32 array, computed via vectorized matrix transformation.
+        """
+        if not self._dirty_transform and self._cached_border_verts is not None:
+            if self._parent is None or not getattr(self._parent, '_dirty_transform', False):
+                return self._cached_border_verts
+
+        _, _, border_pts = _get_unit_circle_templates(self.num_segments)
+        local_pts = border_pts * self._radius
+        w_border = self.transform_points(local_pts).T.astype(np.float32)
+        res = np.ascontiguousarray(w_border)
+        self._cached_border_verts = res
+        return res
+
+    def get_aabb(self, qt_format=True):
+        """
+        Get coordinates of axis-aligned bounding box.
+        """
+        center = self.transform_points(np.array([0.0, 0.0]))
+        r = self._radius
+        minx, miny = float(center[0] - r), float(center[1] - r)
+        maxx, maxy = float(center[0] + r), float(center[1] + r)
+        return (minx, miny, maxx, maxy) if qt_format else np.array(((minx, maxx), (miny, maxy)))
+
+
 class DrawableGroup(TF2DOwner):
     """
     A composite collection of DrawableRects and nested DrawableGroups that share
@@ -670,7 +831,7 @@ class DrawableGroup(TF2DOwner):
         parent: TF2DOwner | None = None,
     ):
         super().__init__(x=x, y=y, theta=theta, parent=parent)
-        self.children: list[DrawableRect | DrawableLineStrip | DrawableGroup] = []
+        self.children: list[DrawableRect | DrawableLineStrip | DrawableCircle | DrawableGroup] = []
         self.visible = visible
 
     def _mark_dirty(self):
@@ -678,7 +839,7 @@ class DrawableGroup(TF2DOwner):
         for child in getattr(self, 'children', ()):
             child._mark_dirty()
 
-    def add(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
+    def add(self, drawable: DrawableRect | DrawableLineStrip | DrawableCircle | DrawableGroup):
         """Adds a child drawable to this group and binds this group as its parent."""
         if drawable not in self.children:
             self.children.append(drawable)
@@ -686,7 +847,7 @@ class DrawableGroup(TF2DOwner):
                 drawable.parent = self
             drawable._mark_dirty()
 
-    def remove(self, drawable: DrawableRect | DrawableLineStrip | DrawableGroup):
+    def remove(self, drawable: DrawableRect | DrawableLineStrip | DrawableCircle | DrawableGroup):
         """Removes a child drawable from this group."""
         if drawable in self.children:
             self.children.remove(drawable)
@@ -702,7 +863,7 @@ class DrawableGroup(TF2DOwner):
             child._mark_dirty()
         self.children.clear()
 
-    def get_all_drawables(self) -> list[DrawableRect | DrawableLineStrip]:
+    def get_all_drawables(self) -> list[DrawableRect | DrawableLineStrip | DrawableCircle]:
         """
         Recursively collects all visible leaf drawables in this group
         using breadth-first traversal (BFS).
@@ -710,7 +871,7 @@ class DrawableGroup(TF2DOwner):
         """
         if not self.visible:
             return []
-        drawables: list[DrawableRect | DrawableLineStrip] = []
+        drawables: list[DrawableRect | DrawableLineStrip | DrawableCircle] = []
         queue = deque(self.children)
         visited = set()
         while queue:
@@ -722,7 +883,7 @@ class DrawableGroup(TF2DOwner):
                 for subchild in child.children:
                     if getattr(subchild, 'visible', True):
                         queue.append(subchild)
-            elif isinstance(child, (DrawableRect, DrawableLineStrip)):
+            elif isinstance(child, (DrawableRect, DrawableLineStrip, DrawableCircle)):
                 drawables.append(child)
         return drawables
 
@@ -733,6 +894,10 @@ class DrawableGroup(TF2DOwner):
     def get_all_line_strips(self) -> list[DrawableLineStrip]:
         """Recursively collects all visible DrawableLineStrip leaves in this group in BFS order."""
         return [d for d in self.get_all_drawables() if isinstance(d, DrawableLineStrip)]
+
+    def get_all_circles(self) -> list[DrawableCircle]:
+        """Recursively collects all visible DrawableCircle leaves in this group in BFS order."""
+        return [d for d in self.get_all_drawables() if isinstance(d, DrawableCircle)]
 
     def __iter__(self):
         return iter(self.children)
@@ -999,7 +1164,7 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
         # -------------------------------------------------------------
         # PASS 2: Render transformed overlay shapes in batches using GPU coordinate mapping
         if self.drawables and self.shape_prog is not None:
-            draw_items: list[DrawableRect | DrawableLineStrip] = []
+            draw_items: list[DrawableRect | DrawableLineStrip | DrawableCircle] = []
             queue = deque(self.drawables)
             visited = set()
             while queue:
@@ -1008,10 +1173,13 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                     continue
                 visited.add(id(item))
                 if isinstance(item, DrawableGroup):
-                    for child in item.children:
-                        if getattr(child, 'visible', True):
-                            queue.append(child)
-                elif isinstance(item, (DrawableRect, DrawableLineStrip)):
+                    if hasattr(item, 'get_tri_vertices'):
+                        draw_items.append(item)
+                    else:
+                        for child in item.children:
+                            if getattr(child, 'visible', True):
+                                queue.append(child)
+                elif isinstance(item, (DrawableRect, DrawableLineStrip, DrawableCircle)):
                     draw_items.append(item)
 
             if draw_items:
@@ -1053,18 +1221,22 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                 line_strips: dict[tuple[str, float], list[tuple[np.ndarray, tuple[float, float, float, float]]]] = {}
 
                 for item in draw_items:
-                    if isinstance(item, DrawableRect):
+                    if hasattr(item, 'get_tri_vertices') or isinstance(item, (DrawableRect, DrawableCircle)):
                         fill_rgba = parse_color_rgba(item.fill_color)
                         if fill_rgba[3] > 0.0:
-                            frame = item.coordinate_frame if item.coordinate_frame in coord_params else "grid"
+                            frame = getattr(item, 'coordinate_frame', 'grid')
+                            if frame not in coord_params:
+                                frame = "grid"
                             tri_v = item.get_tri_vertices()
                             if tri_v.shape[0] > 0:
                                 rect_fills.setdefault(frame, []).append((tri_v, fill_rgba))
 
-                        if item.border_color is not None and item.border_width > 0.0:
+                        if getattr(item, 'border_color', None) is not None and getattr(item, 'border_width', 0.0) > 0.0:
                             border_rgba = parse_color_rgba(item.border_color)
                             if border_rgba[3] > 0.0:
-                                frame = item.coordinate_frame if item.coordinate_frame in coord_params else "grid"
+                                frame = getattr(item, 'coordinate_frame', 'grid')
+                                if frame not in coord_params:
+                                    frame = "grid"
                                 b_width = max(1.0, float(item.border_width))
                                 b_v = item.get_border_vertices()
                                 if b_v.shape[0] > 0:
@@ -1080,12 +1252,29 @@ class ObstacleFieldWidget(TF2DOwner, OpenGLFrame):
                                 line_strips.setdefault((frame, l_width), []).append((segs, c_rgba))
 
                 def _draw_batch(items: list[tuple[np.ndarray, tuple[float, float, float, float]]], mode: int):
-                    total_v = sum(it[0].shape[0] for it in items)
-                    buf = np.empty((total_v, 6), dtype=np.float32)
-                    np.concatenate([it[0] for it in items], out=buf[:, :2])
-                    counts = [it[0].shape[0] for it in items]
-                    colors = np.array([it[1] for it in items], dtype=np.float32)
-                    buf[:, 2:] = np.repeat(colors, counts, axis=0)
+                    if not items:
+                        return
+                    if len(items) == 1:
+                        v, col = items[0]
+                        total_v = v.shape[0]
+                        if total_v == 0:
+                            return
+                        buf = np.empty((total_v, 6), dtype=np.float32)
+                        buf[:, :2] = v
+                        buf[:, 2:] = col
+                    else:
+                        total_v = sum(it[0].shape[0] for it in items)
+                        if total_v == 0:
+                            return
+                        buf = np.empty((total_v, 6), dtype=np.float32)
+                        np.concatenate([it[0] for it in items], out=buf[:, :2])
+                        first_col = items[0][1]
+                        if all(it[1] == first_col for it in items):
+                            buf[:, 2:] = first_col
+                        else:
+                            counts = [it[0].shape[0] for it in items]
+                            colors = np.array([it[1] for it in items], dtype=np.float32)
+                            buf[:, 2:] = np.repeat(colors, counts, axis=0)
                     GL.glBufferData(GL.GL_ARRAY_BUFFER, buf.nbytes, buf, GL.GL_DYNAMIC_DRAW)
                     GL.glVertexAttribPointer(loc_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 24, None)
                     GL.glVertexAttribPointer(loc_col, 4, GL.GL_FLOAT, GL.GL_FALSE, 24, ctypes.c_void_p(8))
@@ -1199,42 +1388,79 @@ def _sync_grid_colors_from_cells():
                 _grid_colors[y, x] = convert_text_to_rgb(_fill_func(row[x]))
 
 
-def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
+def populate_cells(
+    coverage: float,
+    use_all_tets: bool = True,
+    canvas=None,
+    blocked_cells: list[tuple[int, int]] | set[tuple[int, int]] | None = None,
+):
     """
     :param coverage: approximate percentage of cells that should be occupied, on [0, 1]
     (tetrominoes may overlap so coverage is an upper bound)
     :param use_all_tets: if true, use all possible tetrominoes instead of just the ones on the assignment doc
     :param canvas: the canvas/widget to draw on
+    :param blocked_cells: optional list or set of (x, y) coordinates to consider blocked for tetromino placement
     :return: A dictionary mapping (x, y) coordinate pairs to tetromino cell arrays placed there
     """
     global _cells, _rects, _grid_colors, obs_quadtree
     _cells = [[[] for _ in range(FIELD_WIDTH)] for _ in range(FIELD_HEIGHT)]
     _rects = np.zeros((FIELD_HEIGHT, FIELD_WIDTH), dtype=np.uint16)
+    if obs_quadtree is not None:
+        obs_quadtree.clear()
+    obs_quadtree = qt.RectQuadTree((0, 0, FIELD_WIDTH, FIELD_HEIGHT), 10)
 
     empty_rgb = convert_text_to_rgb(_fill_func([]))
     _grid_colors = np.full((FIELD_HEIGHT, FIELD_WIDTH, 3), empty_rgb, dtype=np.uint8)
+
+    blocked_set = {(int(c[0]), int(c[1])) for c in (blocked_cells or ())}
 
     tetrominoes = get_all_tetrominoes() if use_all_tets else get_basic_tetrominoes()
     total = int(coverage * FIELD_HEIGHT * FIELD_WIDTH / 4)
     print(f'Placing {total} tetrominoes...')
     tets_to_place = _rng.integers(len(tetrominoes), size=total)
-    placed_coords = {}
+    cell_to_root = {}
+    root_to_cells = {}
     for tet in tets_to_place:
-        tet_cells = tetrominoes[tet]
-        tet_bounds = np.shape(tet_cells)
-        x = _rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True)
-        y = _rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True)
-        for i in np.ndindex(tet_bounds):
-            if tet_cells[i] == 1:
-                cy, cx = y + i[0], x + i[1]
-                cell = _cells[cy][cx]
-                if len(cell) > 0:
-                    cell[0] = tet_cells[i]
-                else:
-                    cell.append(tet_cells[i])
-                    obs_quadtree.insert((cx, cy, cx + 1, cy + 1))
+        placed = False
+        candidates = [int(tet)] + [int(_rng.integers(len(tetrominoes))) for _ in range(5)]
+        for candidate_tet in candidates:
+            tet_cells = tetrominoes[candidate_tet]
+            tet_bounds = np.shape(tet_cells)
+            for _ in range(100):
+                x = int(_rng.integers(0, FIELD_WIDTH - tet_bounds[1], endpoint=True))
+                y = int(_rng.integers(0, FIELD_HEIGHT - tet_bounds[0], endpoint=True))
+                if (x, y) in root_to_cells:
+                    continue
 
-        placed_coords[(x, y)] = tet_cells
+                overlap = False
+                cells_for_tet = []
+                for i in np.ndindex(tet_bounds):
+                    if tet_cells[i] == 1:
+                        cy, cx = y + i[0], x + i[1]
+                        if (
+                            (cx, cy) in blocked_set
+                            or (cx, cy) in cell_to_root
+                            or (len(_cells[cy][cx]) > 0 and _cells[cy][cx][0] > 0)
+                        ):
+                            overlap = True
+                            break
+                        cells_for_tet.append((cx, cy, tet_cells[i]))
+
+                if not overlap:
+                    root_to_cells[(x, y)] = []
+                    for cx, cy, val in cells_for_tet:
+                        cell_to_root[(cx, cy)] = (x, y)
+                        root_to_cells[(x, y)].append((cx, cy))
+                        cell = _cells[cy][cx]
+                        if len(cell) > 0:
+                            cell[0] = val
+                        else:
+                            cell.append(val)
+                        obs_quadtree.insert((cx, cy, cx + 1, cy + 1))
+                    placed = True
+                    break
+            if placed:
+                break
 
     # Vectorized color assignment for occupied cells
     wall_rgb = convert_text_to_rgb(_fill_func([1]))
@@ -1243,7 +1469,7 @@ def populate_cells(coverage: float, use_all_tets: bool = True, canvas=None):
 
     if canvas is not None:
         draw_grid()
-    return placed_coords
+    return root_to_cells, cell_to_root
 
 __bounds_cache: dict[tuple[int, int, int, int, int], np.ndarray] = {}
 

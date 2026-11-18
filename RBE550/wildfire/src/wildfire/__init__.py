@@ -1,95 +1,245 @@
+from __future__ import annotations
+import atexit
+import csv
+import datetime
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk
+from pathlib import Path
+
+import numpy as np
+import fastquadtree as qt
+
 import valet.obstacle_field as obs
 import valet.grid_sim as ui
 import valet.planner as plan
 
+# Ensure the wildfire package directory is on sys.path so intra-package modules
+# (firetruck, wumpus, shrubbery) are resolved from the exact same top-level namespace.
+_pkg_dir = str(Path(__file__).parent.resolve())
+if _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
+
+from firetruck import Firetruck
+from wumpus import Wumpus
+import shrubbery as shr
+
+# Alias in sys.modules so imports referencing wildfire.* point to the exact same module instances
+sys.modules.setdefault('wildfire.shrubbery', shr)
+sys.modules.setdefault('wildfire.firetruck', sys.modules['firetruck'])
+sys.modules.setdefault('wildfire.wumpus', sys.modules['wumpus'])
+
+__all__ = ["main", "Firetruck", "Wumpus", "shr"]
+
+sim_time = 0.0
+firetruck_cumulative_cpu_time = 0.0
+wumpus_cumulative_cpu_time = 0.0
+last_log_time = -np.inf
+
+class CSVStatsLogger:
+    """
+    Consumes stats records in a dedicated background worker thread and appends them to disk.
+    """
+    def __init__(self, log_paths: list[str]):
+        self.log_paths = log_paths
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread.start()
+
+    def _worker(self):
+        files = []
+        writers = []
+        for path in self.log_paths:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                f = open(path, 'w', newline='', encoding='utf-8')
+                writer = csv.writer(f)
+                writer.writerow(['process_time_s', 'sim_time_s', 'firetruck_cpu_time_s', 'wumpus_cpu_time_s'])
+                f.flush()
+                files.append(f)
+                writers.append(writer)
+            except Exception as e:
+                print(f"Failed to open log file {path}: {e}")
+
+        try:
+            while not self.stop_event.is_set() or not self.queue.empty():
+                try:
+                    row = self.queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                for writer in writers:
+                    writer.writerow(row)
+                for f in files:
+                    f.flush()
+                self.queue.task_done()
+        finally:
+            for f in files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+    def log(self, process_time: float, sim_time_val: float, ft_cpu: float, wump_cpu: float) -> None:
+        self.queue.put((process_time, sim_time_val, ft_cpu, wump_cpu))
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=2.0)
+
+
 def main() -> None:
-    obs.FIELD_HEIGHT = 12
-    obs.FIELD_WIDTH = 12
+    global sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time
+    obs.FIELD_HEIGHT = 25
+    obs.FIELD_WIDTH = 25
     obs._cell_width = 25
     obs._cell_height = 25
+    ui.METERS_PER_CELL = 5.
+    ui.time_rate = 8.
     _root_window, _frame, _canvas = ui.create_window()
     obs.draw_grid()
-    obs.populate_cells(0.1, True, _canvas)
+    truck_spawn_cells = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]
+    wumpus_spawn_cells = [(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1)]
+    blocked_cells = truck_spawn_cells + wumpus_spawn_cells
+    obstacle_to_cells, cell_to_obstacle = obs.populate_cells(0.1, True, _canvas, blocked_cells=blocked_cells)
 
-    # start and parking spots
-    obs.clear_cell(0, 0)
-    obs.clear_cell(0, 1)
+    shr.init(obs.FIELD_WIDTH, obs.FIELD_HEIGHT, cell_to_obstacle, obstacle_to_cells)
 
-    obs.clear_cell(8, 11)
-    obs.clear_cell(9, 11)
-    obs.add_to_cell(6, 11, 1)
-    obs.add_to_cell(7, 11, 1)
-    obs.add_to_cell(10, 11, 1)
-    obs.add_to_cell(11, 11, 1)
+    for rect in shr.get_all_obstacle_rects():
+        _canvas.add_drawable(rect)
 
-    goal_rect = obs.DrawableRect(9, 11.5, 2, 1, fill_color=(0, 1, 0, 0.5), parent=_canvas)
-    _canvas.add_drawable(goal_rect)
+    for region in shr.get_all_ext_regions():
+        _canvas.add_drawable(region)
 
-    # car = Vehicle(meters_to_cells(5.2), meters_to_cells(1.8))
-    robot = plan.Car()
-    _canvas.add_drawable(robot)
+    truck = Firetruck(0.5, 1, np.pi/2, turn_radius=13, obs_quadtree=obs.obs_quadtree)
+    wump = Wumpus(obs.FIELD_WIDTH - 1, obs.FIELD_HEIGHT - 1, obs.FIELD_WIDTH, obs.FIELD_HEIGHT, obs.obs_quadtree)
+    wump.truck = truck
+    _canvas.add_drawable(truck)
+    _canvas.add_drawable(wump)
+    if truck.default_goal is not None:
+        _canvas.add_drawable(truck.default_goal)
+
+    truck.prm.visualizer.canvas = _canvas
+    ui.checkbox_toggle_callback = truck.prm.visualizer.update_visualization
+
+    # Initialize CSV logger
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%H_%M")
+    filename = f"wildfire_stats_{timestamp}.csv"
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    wildfire_root = os.path.abspath(os.path.join(this_dir, "..", ".."))
+    repo_root = os.path.abspath(os.path.join(wildfire_root, "..", ".."))
+    log_paths = list(dict.fromkeys([
+        os.path.join(repo_root, "logs", filename),
+        os.path.join(wildfire_root, "logs", filename),
+    ]))
+    csv_logger = CSVStatsLogger(log_paths)
+    atexit.register(csv_logger.close)
+
+    # Statistics UI frame & Read-only Textboxes
+    stats_frame = ttk.LabelFrame(_frame, text="Simulation Statistics", padding=5)
+    stats_frame.grid(row=5, column=0, columnspan=4, padx=5, pady=5, sticky='ew')
+
+    ttk.Label(stats_frame, text="Simulation Time:").grid(row=0, column=0, padx=5, pady=2, sticky='w')
+    sim_time_var = tk.StringVar(value="0.00 s")
+    sim_time_entry = ttk.Entry(stats_frame, textvariable=sim_time_var, state='readonly', width=12)
+    sim_time_entry.grid(row=0, column=1, padx=5, pady=2, sticky='w')
+
+    ttk.Label(stats_frame, text="Unburnt Obstacles:").grid(row=0, column=2, padx=5, pady=2, sticky='w')
+    unburnt_obs_var = tk.StringVar(value=str(shr.get_unburnt_obstacle_count()))
+    unburnt_obs_entry = ttk.Entry(stats_frame, textvariable=unburnt_obs_var, state='readonly', width=12)
+    unburnt_obs_entry.grid(row=0, column=3, padx=5, pady=2, sticky='w')
+
+    ttk.Label(stats_frame, text="Firetruck Score:").grid(row=1, column=0, padx=5, pady=2, sticky='w')
+    ft_score_var = tk.StringVar(value="0")
+    ft_score_entry = ttk.Entry(stats_frame, textvariable=ft_score_var, state='readonly', width=12)
+    ft_score_entry.grid(row=1, column=1, padx=5, pady=2, sticky='w')
+
+    ttk.Label(stats_frame, text="Wumpus Score:").grid(row=1, column=2, padx=5, pady=2, sticky='w')
+    wumpus_score_var = tk.StringVar(value="0")
+    wumpus_score_entry = ttk.Entry(stats_frame, textvariable=wumpus_score_var, state='readonly', width=12)
+    wumpus_score_entry.grid(row=1, column=3, padx=5, pady=2, sticky='w')
 
     def step_time_callback():
-        global counter, last_x, last_y
-        robot.run_queued_motions(ui.time_rate / ui.fps)
-        if robot.check_collision(obs.obs_quadtree):
-            robot.body.fill_color = (1.0, 0, 0)
+        global sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time, last_log_time
+        if sim_time >= 3600:
+            proc_time = time.perf_counter()
+            csv_logger.log(proc_time, sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time)
+            last_log_time = sim_time
+            print(f'Simulation ended at {sim_time}; A WINNER IS {"WUMPUS" if shr._wumpus_score > shr._firetruck_score else
+            "FIRETRUCK" if shr._firetruck_score > shr._wumpus_score else
+            "YOU?" }')
             ui._current_time_rate = 0
-            print(f'robot crashed')
-        robot.update_visualization()
+
+        dt = ui.time_rate / ui.fps
+        sim_time += dt
+
+        # Firetruck step timed, excluding PRMVisualizer time
+        t_ft0 = time.perf_counter()
+        vis_t0 = truck.prm.visualizer.total_time
+        truck.step(dt)
+        vis_elapsed = truck.prm.visualizer.total_time - vis_t0
+        firetruck_cumulative_cpu_time += max(0.0, (time.perf_counter() - t_ft0) - vis_elapsed)
+
+        if truck.check_collision(obs.obs_quadtree):
+            truck.body.fill_color = (1.0, 0, 0)
+            ui._current_time_rate = 0
+            print(f'truck crashed')
+
+        # Wumpus step timed
+        t_wump0 = time.perf_counter()
+        wump.step(dt)
+        wumpus_cumulative_cpu_time += max(0.0, time.perf_counter() - t_wump0)
+
+        if wump.check_collision():
+            wump.body.fill_color = (1.0, 0, 0)
+            ui._current_time_rate = 0
+            print(f'wumpus crashed?')
+
+        shr.step(dt)
+
+        # Log statistics to background thread
+        if sim_time - 10 > last_log_time:
+            proc_time = time.perf_counter()
+            csv_logger.log(proc_time, sim_time, firetruck_cumulative_cpu_time, wumpus_cumulative_cpu_time)
+            last_log_time = sim_time
+
+        # Update UI statistics textboxes
+        sim_time_var.set(f"{sim_time:.2f} s")
+        ft_score_var.set(str(shr.get_firetruck_score()))
+        wumpus_score_var.set(str(shr.get_wumpus_score()))
+        unburnt_obs_var.set(str(shr.get_unburnt_obstacle_count()))
+
         ui.update_preview_pose()
         _canvas.redraw()
 
     ui.step_time_callback = step_time_callback
-    ui.set_active_vehicle(robot)
-    ui.clear_visualization_callback = robot.clear_visualizations
 
     obs.draw_grid()
     _frame.pack()
 
-    def run_astar():
-        print(f'running A* from {robot.x, robot.y, robot.theta}')
-        parking_space = (8.0, 11.0, 10.0, 12.0)
-        # 2x2 expanded goal region covering the parking space and adjacent driving aisle
-        astar_goal_region = (8.0, 10.0, 10.0, 12.0)
-        start_node = plan.MPSearchNode(None, robot.x, robot.y, robot.theta, 1, robot.body)
-        path = robot.astar(start_node, astar_goal_region)
-        counter = 0
-        if path is None:
-            print(f'No path found')
-            return
-        path = list(path)
-        robot.optimal_path_line_strips = [
-            getattr(path_segment, 'line_strip', None)
-            for path_segment in path
-            if getattr(path_segment, 'line_strip', None) is not None
-        ]
-        for path_segment in path:
-            print(f'{counter}: {path_segment}')
-            if path_segment.via:
-                robot.queue_motion(path_segment.via)
-            counter += 1
+    def run_planning():
+        global firetruck_cumulative_cpu_time
+        t_ft0 = time.perf_counter()
+        vis_t0 = truck.prm.visualizer.total_time
+        truck.prm.generate_roadmap()
+        vis_elapsed = truck.prm.visualizer.total_time - vis_t0
+        firetruck_cumulative_cpu_time += max(0.0, (time.perf_counter() - t_ft0) - vis_elapsed)
+        _canvas.redraw()
 
-        end_node = path[-1] if len(path) > 0 else start_node
-        local_mps = getattr(robot, '_cached_local_plan', None)
-        if local_mps is None:
-            local_mps = robot.local_planner(end_node, parking_space, None, obs.obs_quadtree)
-        if local_mps is not None:
-            for mp in local_mps:
-                print(f'{counter} (local): {mp}')
-                robot.queue_motion(mp)
-                strip = getattr(mp, 'world_line_strip', None)
-                if strip is not None:
-                    robot.optimal_path_line_strips.append(strip)
-                    if _canvas is not None:
-                        _canvas.add_drawable(strip)
-                counter += 1
-        else:
-            print('No collision-free Reeds-Shepp path found by local planner')
+    ui.run_planning_callback = run_planning
 
-        robot.update_visualization()
-        if _canvas is not None and getattr(_canvas, 'context_created', False):
-            _canvas.display()
+    def on_window_close():
+        csv_logger.close()
+        _root_window.destroy()
 
-    ui.run_astar_callback = run_astar
+    _root_window.protocol("WM_DELETE_WINDOW", on_window_close)
     _root_window.mainloop()
+
+if __name__ == '__main__':
+    main()
