@@ -20,7 +20,14 @@ def main() -> None:
     print(f'c1 ({c1}) collides with c2 ({c2}): {check_cylinders(c1, c2, fig)}')
 
     c2.origin = np.array((1.4, 1.4, 2))
-    c2.direction = np.array((-1, 0, 1))/np.sqrt(2)
+    c2.direction = np.array((-1., 0., 1.))
+    c2.direction /= np.linalg.norm(c2.direction)
+    fig = plt.figure()
+    print(f'c1 ({c1}) collides with c2 ({c2}): {check_cylinders(c1, c2, fig)}')
+
+    c2.origin = np.array((.707, 0, 2.708))
+    c2.direction = np.array((-1., 0., 1.))
+    c2.direction /= np.linalg.norm(c2.direction)
     fig = plt.figure()
     print(f'c1 ({c1}) collides with c2 ({c2}): {check_cylinders(c1, c2, fig)}')
     plt.show(block=True)

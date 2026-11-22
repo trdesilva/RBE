@@ -6,8 +6,9 @@ from geometry import Cylinder
 def check_cylinders(c1: Cylinder, c2: Cylinder, fig: plt.Figure|None = None):
     """
     Implementation of method from "COLLISION DETECTION OF CYLINDRICAL RIGID BODIES USING LINE GEOMETRY" by John S.
-    Ketchel and Pierre M. Larochelle.
-    (http://larochelle.sdsmt.edu/publications/2005-2009/Collision%20Detection%20of%20Cylindrical%20Rigid%20Bodies%20Using%20Line%20Geometry.pdf)
+    Ketchel and Pierre M. Larochelle. DOI: 10.1109/ROBOT.2006.1641925
+    (No-paywall early draft, but it's missing the _tp2_search section:
+    http://larochelle.sdsmt.edu/publications/2005-2009/Collision%20Detection%20of%20Cylindrical%20Rigid%20Bodies%20Using%20Line%20Geometry.pdf )
     :param c1:
     :param c2:
     :return: True if c1 collides with c2, False otherwise
@@ -22,7 +23,7 @@ def check_cylinders(c1: Cylinder, c2: Cylinder, fig: plt.Figure|None = None):
         n = np.cross(s, w) # common normal of c1 and c2
         if np.linalg.norm(n) == 0:
             # c1 and c2 are parallel
-            n = c2.origin - c1.origin
+            return np.linalg.norm(c2.origin - c1.origin) <= c1.radius + c2.radius
         t1 = np.dot(np.cross((c2.origin - c1.origin), w), n)/np.dot(n, n) # distance parameter along s for where n meets
         t2 = np.dot(np.cross((c2.origin - c1.origin), s), n)/np.dot(n, n) # distance parameter along w for where n meets
         p = c1.origin + t1*s # point where n meets s
@@ -51,11 +52,8 @@ def _on_test(c1, s, p, c2, w, q, t2):
             tp1 = c1.origin if t3 <= 0 else c1.origin + s # closest point on c1's axis to tp2
             if np.linalg.norm(tp1 - p1) > c2.radius:
                 return False
-        # TODO the paper seems to be wrong about this method of choosing n?
-        n = (p - q)/np.linalg.norm(p - q) if not np.allclose(p, q) else np.zeros(3)
-        tp2_prime = tp2 + c2.radius*n
-        p1_prime = c1.origin - (np.dot((c1.origin - tp2_prime), c1.direction) * c1.direction)
-        t3_prime = np.dot(p1_prime - c1.origin, s) / np.dot(s, s)
+
+        tp2_prime, p1_prime, t3_prime = _tp2_search(c1, c2, tp2)
         if 0 <= t3_prime <= 1:
             return np.linalg.norm(tp2_prime - p1_prime) <= c1.radius
         if 0 <= t3 <= 1:
@@ -65,6 +63,43 @@ def _on_test(c1, s, p, c2, w, q, t2):
     else:
         # normal distance is greater than sum of radii, so no collision possible
         return False
+
+def _tp2_search(c1, c2, tp2):
+    theta = 0
+    inc = np.pi/2
+    p1_prime = c1.origin
+    t3_prime = 0
+    # use Rodrigues' rotation formula to test different points around the edge of c2
+    n = np.cross(c1.direction, c2.direction)
+    tp2_delta = c2.radius*n/np.linalg.norm(n) # center to edge of c2 face along common normal with c1
+    delta_ax_cross = np.cross(c2.direction, tp2_delta)
+    result = (tp2 + tp2_delta, p1_prime, t3_prime)
+    while inc > 0.01:
+        d_min = np.inf
+        counter = 0
+        while True:
+            tp2_prime = tp2 + (c2.direction * np.dot(c2.direction, tp2_delta) + # rotate tp2_delta by theta
+                               np.cross(np.cos(theta) * delta_ax_cross, c2.direction) +
+                               np.sin(theta) * delta_ax_cross)
+            p1_prime = c1.origin - (np.dot((c1.origin - tp2_prime), c1.direction) * c1.direction)
+            d = np.linalg.norm(p1_prime - tp2_prime)
+            if d < d_min:
+                d_min = d
+                t3_prime = np.dot(p1_prime - c1.origin, c1.direction)
+                result = (tp2_prime, p1_prime, t3_prime)
+                if 0 <= t3_prime <= 1 and d < c1.radius:
+                    # collision guaranteed, stop searching
+                    return result
+                theta += inc
+                counter += 1
+            else:
+                break
+        if counter == 0:
+            theta -= inc
+        else:
+            theta -= 2*inc
+        inc /= 2
+    return result
 
 def _end_test(c1, s, tp1, c2, w, tp2):
     # check if intersection of planes parallel to cylinder ends which pass through test points is inside the end faces
@@ -88,16 +123,16 @@ def _end_test(c1, s, tp1, c2, w, tp2):
             t5_roots[0] <= t4_roots[0] <= t5_roots[1] or t5_roots[0] <= t4_roots[1] <= t5_roots[1])
 
 def _off_test(c1, s, p, c2, w, q, is_retry = False):
-    # do _on_tests with axis endpoints (TODO: this doesn't seem like it needs to be a separate step to me, but it's in the paper)
+    # do _on_tests with axis endpoints (TODO: this seems like it could be folded into _on_test, but it's in the paper)
     tp2 = c2.origin
-    p1 = c1.origin - (np.dot((c1.origin - tp2), s) * s)
+    p1 = c1.origin - np.dot(c1.origin - tp2, c1.direction)*c1.direction
     if np.linalg.norm(tp2 - p1) <= c1.radius + c2.radius:
         # this end is close enough to warrant more detailed checking
         collides = _on_test(c1, s, p1, c2, w, tp2, 0)
         if collides:
             return True
     tp2 = c2.origin + w
-    p1 = c1.origin - (np.dot((c1.origin - tp2), s) * s)
+    p1 = c1.origin - np.dot(c1.origin - tp2, c1.direction)*c1.direction
     if np.linalg.norm(tp2 - p1) <= c1.radius + c2.radius:
         collides = _on_test(c1, s, p1, c2, w, tp2, 1)
         if collides:

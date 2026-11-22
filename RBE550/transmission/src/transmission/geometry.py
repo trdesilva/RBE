@@ -11,7 +11,7 @@ class Cylinder:
         self.direction = np.array(direction)/d_norm if d_norm > 0 else np.array((0, 0, 1))
 
     def __repr__(self):
-        return f'{self.radius}x{self.height} @ {self.origin}, {self.direction}'
+        return f'{self.radius}r x {self.height}h @ {self.origin}, {self.direction}'
 
     def render(self, fig, resolution=50, caps=True, **kwargs):
         """
