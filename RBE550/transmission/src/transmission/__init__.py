@@ -14,7 +14,7 @@ def main() -> None:
     fig = plt.figure()
     print(f'c1 ({c1}) collides with c2 ({c2}): {check_cylinders(c1, c2, fig)}')
 
-    c2.origin = np.array((3.01, 0, 0))
+    c2.origin = np.array((2.99, 0, 0))
     c2.direction = np.array((-1, 0, 0))
     fig = plt.figure()
     print(f'c1 ({c1}) collides with c2 ({c2}): {check_cylinders(c1, c2, fig)}')

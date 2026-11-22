@@ -28,6 +28,10 @@ def check_cylinders(c1: Cylinder, c2: Cylinder, fig: plt.Figure|None = None):
         t2 = np.dot(np.cross((c2.origin - c1.origin), s), n)/np.dot(n, n) # distance parameter along w for where n meets
         p = c1.origin + t1*s # point where n meets s
         q = c2.origin + t2*w # point where n meets w
+        if np.linalg.norm(p - q) > c1.radius + c2.radius:
+            # the axes never get close enough to collide regardless of cylinder length
+            return False
+
         if ax is not None:
             _plot_vectors(np.column_stack((t1*s, t2*w, n)), np.column_stack((c1.origin, c2.origin, p)), ax)
         if 0 <= t1 <= 1 and 0 <= t2 <= 1:
@@ -35,7 +39,7 @@ def check_cylinders(c1: Cylinder, c2: Cylinder, fig: plt.Figure|None = None):
             return np.linalg.norm(p - q) <= c1.radius + c2.radius
         elif 0 <= t1 <= 1 or 0 <= t2 <= 1:
             # common normal intersects one cylinder
-            return _on_test(c1, s, p, c2, w, q, t2) if 0 <= t1 <= 1 else _on_test(c2, w, q, c1, s, p, t1)
+            return _on_test(c1, s, c2, w, t2) if 0 <= t1 <= 1 else _on_test(c2, w, c1, s, t1)
         else:
             # common normal intersects neither cylinder
             return _off_test(c1, s, p, c2, w, q)
@@ -43,11 +47,11 @@ def check_cylinders(c1: Cylinder, c2: Cylinder, fig: plt.Figure|None = None):
         if ax is not None:
             ax.set_aspect('equal')
 
-def _on_test(c1, s, p, c2, w, q, t2):
-    tp2 = c2.origin if t2 <= 0 else c2.origin + w # closest point on c2's axis to the common normal
+def _on_test(c1, s, c2, w, t2):
+    tp2 = c2.origin if t2 <= 0.5 else c2.origin + w # closest point on c2's axis to the common normal
     p1 = c1.origin - np.dot(c1.origin - tp2, c1.direction)*c1.direction # closest point on c1's axis to tp2
     if np.linalg.norm(tp2 - p1) <= c1.radius + c2.radius:
-        t3 = np.dot(p1 - c1.origin, s)/np.dot(s, s) # distance param along s from c1.origin to p1
+        t3 = np.dot(p1 - c1.origin, c1.direction) # distance param along s from c1.origin to p1
         if t3 < 0 or 1 < t3:
             tp1 = c1.origin if t3 <= 0 else c1.origin + s # closest point on c1's axis to tp2
             if np.linalg.norm(tp1 - p1) > c2.radius:
@@ -55,9 +59,10 @@ def _on_test(c1, s, p, c2, w, q, t2):
 
         tp2_prime, p1_prime, t3_prime = _tp2_search(c1, c2, tp2)
         if 0 <= t3_prime <= 1:
+            # tp2 is between the top and bottom of c1
             return np.linalg.norm(tp2_prime - p1_prime) <= c1.radius
         if 0 <= t3 <= 1:
-            tp1 = c1.origin if t3_prime <= 0 else c1.origin + s
+            tp1 = c1.origin if t3_prime <= 0.5 else c1.origin + s
             return _end_test(c1, s, tp1, c2, w, tp2_prime)
         return False
     else:
@@ -122,25 +127,25 @@ def _end_test(c1, s, tp1, c2, w, tp2):
     return (t4_roots[0] <= t5_roots[0] <= t4_roots[1] or t4_roots[0] <= t5_roots[1] <= t4_roots[1] or
             t5_roots[0] <= t4_roots[0] <= t5_roots[1] or t5_roots[0] <= t4_roots[1] <= t5_roots[1])
 
-def _off_test(c1, s, p, c2, w, q, is_retry = False):
+def _off_test(c1, s, c2, w, is_retry = False):
     # do _on_tests with axis endpoints (TODO: this seems like it could be folded into _on_test, but it's in the paper)
     tp2 = c2.origin
     p1 = c1.origin - np.dot(c1.origin - tp2, c1.direction)*c1.direction
     if np.linalg.norm(tp2 - p1) <= c1.radius + c2.radius:
         # this end is close enough to warrant more detailed checking
-        collides = _on_test(c1, s, p1, c2, w, tp2, 0)
+        collides = _on_test(c1, s, c2, w, 0)
         if collides:
             return True
     tp2 = c2.origin + w
     p1 = c1.origin - np.dot(c1.origin - tp2, c1.direction)*c1.direction
     if np.linalg.norm(tp2 - p1) <= c1.radius + c2.radius:
-        collides = _on_test(c1, s, p1, c2, w, tp2, 1)
+        collides = _on_test(c1, s, c2, w, 1)
         if collides:
             return True
 
     if not is_retry:
         # switch the cylinders
-        return _off_test(c2, w, q, c1, s, p, True)
+        return _off_test(c2, w, c1, s, True)
     return False
 
 def _plot_vectors(vectors: np.typing.NDArray, origins:np.typing.NDArray, ax: plt3.Axes3D):
