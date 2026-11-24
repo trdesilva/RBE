@@ -121,7 +121,7 @@ def _end_test(c1, s, tp1, c2, w, tp2):
                          2 * m[0] * (xyz0[0] - tp2[0]) + 2 * m[1] * (xyz0[1] - tp2[1]) + 2 * m[2] * (xyz0[2] - tp2[2]),
                          (xyz0[0] - tp2[0]) ** 2 + (xyz0[1] - tp2[1]) ** 2 + (xyz0[2] - tp2[2]) ** 2 - c2.radius ** 2))
     if np.iscomplex(t5_roots[0]):
-        # intersection line doesn't pass through the end face of c1
+        # intersection line doesn't pass through the end face of c2
         return False
     # check if the parts of the intersection line that are inside each face overlap
     return (t4_roots[0] <= t5_roots[0] <= t4_roots[1] or t4_roots[0] <= t5_roots[1] <= t4_roots[1] or
@@ -150,3 +150,120 @@ def _off_test(c1, s, c2, w, is_retry = False):
 
 def _plot_vectors(vectors: np.typing.NDArray, origins:np.typing.NDArray, ax: plt3.Axes3D):
     ax.quiver(*origins.reshape((3, -1)), *vectors.reshape((3, -1)))
+
+def check_hole(c_obj: Cylinder, c_hole: Cylinder, fig: plt.Figure|None = None) -> bool:
+    """
+    Analytically determines whether a solid cylindrical object passes through a
+    cylindrical hole without colliding with the radial boundary (the circular rims or walls) of the hole.
+
+    :param c_obj: Cylinder representing the solid cylindrical object
+    :param c_hole: Cylinder representing the cylindrical hole in another object
+    :param fig: Optional matplotlib Figure to render visualization
+    :return: True if the object does not collide with the edge of the hole, False otherwise
+    """
+    ax = None
+    try:
+        if fig is not None:
+            ax = c_hole.render(fig, alpha=0.25, color='gray')
+            c_obj.render(ax, alpha=0.7, color='cyan')
+
+        d_obj = c_obj.direction / np.linalg.norm(c_obj.direction)
+        d_hole = c_hole.direction / np.linalg.norm(c_hole.direction)
+        s = c_obj.height * d_obj
+        w = c_hole.height * d_hole
+        m = np.cross(s, w)
+
+        # Case 1: Parallel axes
+        if np.linalg.norm(m) == 0:
+            diff = c_obj.origin - c_hole.origin
+            d_perp = np.linalg.norm(diff - np.dot(diff, d_hole) * d_hole)
+            # For the object to pass cleanly through, it must fit inside the hole's radius
+            result = (d_perp + c_obj.radius) <= c_hole.radius
+            if ax is not None:
+                ax.set_title(f"Parallel: {'Passes through (No Collision)' if result else 'Collision with hole edge'}")
+            return result
+
+        # Case 2: Object axis perpendicular to hole axis (parallel to hole end planes)
+        dot_d = np.dot(d_obj, d_hole)
+        if abs(dot_d) < 1e-9:
+            if ax is not None:
+                ax.set_title("Perpendicular axis: Collision")
+            return False
+
+        # Two planes of interest: bottom and top planes of the hole cylinder
+        O_h_bot = c_hole.origin
+        O_h_top = c_hole.origin + w
+
+        # Parametric intersection of object axis line with hole top/bottom planes
+        lam_bot = np.dot(O_h_bot - c_obj.origin, d_hole) / dot_d
+        lam_top = np.dot(O_h_top - c_obj.origin, d_hole) / dot_d
+
+        I_bot = c_obj.origin + lam_bot * d_obj
+        I_top = c_obj.origin + lam_top * d_obj
+
+        # Vectors from plane origins to object axis intersection points
+        v_bot = I_bot - O_h_bot
+        v_top = I_top - O_h_top
+
+        norm_v_bot = np.linalg.norm(v_bot)
+        norm_v_top = np.linalg.norm(v_top)
+
+        # Fallback orthogonal unit vector for concentric case (axis through hole center)
+        ref = np.array([1.0, 0.0, 0.0]) if abs(d_hole[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u_ref = np.cross(d_hole, ref)
+        u_ref /= np.linalg.norm(u_ref)
+
+        tp_bot = O_h_bot + (c_hole.radius * v_bot / norm_v_bot if norm_v_bot > 1e-9 else c_hole.radius * u_ref)
+        tp_top = O_h_top + (c_hole.radius * v_top / norm_v_top if norm_v_top > 1e-9 else c_hole.radius * u_ref)
+
+        test_points = [
+            ('bottom', tp_bot, O_h_bot),
+            ('top', tp_top, O_h_top)
+        ]
+
+        collides = False
+        for name, tp, O_hp in test_points:
+            # Parametric t parameter for object slice plane passing through tp
+            t = np.dot(tp - c_obj.origin, d_obj) / c_obj.height
+
+            if 0.0 <= t <= 1.0:
+                O_slice = c_obj.origin + t * s
+
+                # Intersection line of hole plane (normal w, through O_hp)
+                # and object slice plane (normal s, through tp)
+                A_mat = np.vstack((s, w, m))
+                rhs = np.array((np.dot(s, tp), np.dot(w, O_hp), 0.0))
+                xyz0 = np.linalg.solve(A_mat, rhs)
+
+                # Distance function from line L(tau) = xyz0 + tau*m to O_slice
+                # Subtract object radius squared: ||xyz0 + tau*m - O_slice||^2 - r_obj^2 = 0
+                quad_A = np.dot(m, m)
+                quad_B = 2.0 * np.dot(m, xyz0 - O_slice)
+                quad_C = np.dot(xyz0 - O_slice, xyz0 - O_slice) - c_obj.radius ** 2
+
+                disc = quad_B ** 2 - 4.0 * quad_A * quad_C
+
+                if ax is not None:
+                    # Plot test point on the edge
+                    ax.scatter([tp[0]], [tp[1]], [tp[2]], color='red' if disc >= 0 else 'lime', s=60, edgecolors='black')
+                    # Plot the intersection line segment near the hole edge
+                    m_norm = m / np.linalg.norm(m)
+                    line_pts = tp + np.outer(np.linspace(-c_hole.radius, c_hole.radius, 10), m_norm)
+                    ax.plot(line_pts[:, 0], line_pts[:, 1], line_pts[:, 2], color='orange', linestyle='--', linewidth=1.5)
+
+                if disc >= 0.0:
+                    collides = True
+                    break
+            else:
+                if ax is not None:
+                    # Test point slice plane does not intersect the finite object cylinder
+                    ax.scatter([tp[0]], [tp[1]], [tp[2]], color='gray', s=30, alpha=0.5)
+
+        result = not collides
+        if ax is not None:
+            status_text = 'Passes through (No Collision)' if result else 'Collision with hole edge'
+            ax.set_title(status_text)
+        return result
+    finally:
+        if ax is not None:
+            ax.set_aspect('equal')
