@@ -1,0 +1,22 @@
+joint_state_broadcaster:
+  ros__parameters:
+    type: joint_state_broadcaster/JointStateBroadcaster
+    update_rate: 50  # Hz
+
+
+rrbot_pid_controller:
+  ros__parameters:
+    type: pid_controller/PidController
+    dof_names:
+      - joint1
+      - joint2
+
+    command_interface: velocity
+
+    reference_and_state_interfaces: ["position"]
+
+    set_current_state_as_first_setpoint: true
+
+    gains:
+      joint1: {p: 6.0, i: 0.0, d: 0.1, u_clamp_max: 3.14, u_clamp_min: -3.14}
+      joint2: {p: 6.0, i: 0.0, d: 0.1, u_clamp_max: 3.14, u_clamp_min: -3.14}
